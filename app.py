@@ -1,6 +1,8 @@
 # ================================================================
-# WALL STREET AI DASHBOARD — Production Build v2.1
-# Fixes: lxml, Gemini model fallback, crypto ticker, EW/Fibonacci
+# WALL STREET AI DASHBOARD — Production Build v2.2
+# Fixes: 403 ticker fetch, API key diagnostics, TypeError in crypto
+# New: Insider buying, portfolio diversity chart, performance cache,
+#      8-decimal share input, OpenInsider scanner filter
 # ================================================================
 
 import streamlit as st
@@ -12,6 +14,7 @@ from plotly.subplots import make_subplots
 import hashlib
 import json
 import requests
+from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
 
@@ -22,63 +25,48 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
 st.markdown("""
 <style>
     .stTabs [data-baseweb="tab"] { font-size: 15px; font-weight: 600; }
     div[data-testid="stMetricValue"] { font-size: 1.05rem; }
+    .insider-buy  { color: #4caf50; font-weight: 600; }
+    .insider-sell { color: #f44336; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
 # ================================================================
 # SECRETS
 # ================================================================
-def _get_secret(key: str) -> str:
+def _secret(key: str) -> str:
     try:
         return st.secrets[key]
     except Exception:
         return ""
 
-GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
-SUPABASE_URL   = _get_secret("SUPABASE_URL")
-SUPABASE_KEY   = _get_secret("SUPABASE_KEY")
+GEMINI_API_KEY = _secret("GEMINI_API_KEY")
+SUPABASE_URL   = _secret("SUPABASE_URL")
+SUPABASE_KEY   = _secret("SUPABASE_KEY")
 
 # ── Gemini client ────────────────────────────────────────────────
-# FIX: Try multiple model strings in order until one succeeds.
-# Google periodically changes preview model IDs — this makes the
-# app resilient to those changes automatically.
+AI_AVAILABLE  = bool(GEMINI_API_KEY)
+gemini_client = None
+ACTIVE_MODEL  = None
+
+# FIX: Full model candidate list — app tries each until one works
 GEMINI_MODEL_CANDIDATES = [
     "gemini-2.5-pro",
     "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-pro-exp-03-25",
-    "gemini-2.5-flash",          # reliable fallback
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.5-flash",
+    "gemini-1.5-pro",
 ]
-
-AI_AVAILABLE   = bool(GEMINI_API_KEY)
-gemini_client  = None
-ACTIVE_MODEL   = None            # resolved at first AI call
 
 if AI_AVAILABLE:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception:
         AI_AVAILABLE = False
-
-def _resolve_model() -> str:
-    """Try each candidate model and return the first that responds."""
-    global ACTIVE_MODEL
-    if ACTIVE_MODEL:
-        return ACTIVE_MODEL
-    for m in GEMINI_MODEL_CANDIDATES:
-        try:
-            gemini_client.models.generate_content(
-                model=m, contents="ping"
-            )
-            ACTIVE_MODEL = m
-            return m
-        except Exception:
-            continue
-    return GEMINI_MODEL_CANDIDATES[-1]   # last-resort flash
 
 # ── Supabase client ──────────────────────────────────────────────
 SUPABASE_AVAILABLE = False
@@ -103,30 +91,35 @@ CRYPTO_TICKERS = {
 
 INTERVAL_MAP = {
     10:  {"history": "3mo", "label": "10-Day  · Short-Term Momentum"},
-    20:  {"history": "6mo", "label": "20-Day  · Short-Term Trend Boundary"},
+    20:  {"history": "6mo", "label": "20-Day  · Short-Term Trend"},
     50:  {"history": "1y",  "label": "50-Day  · Institutional Baseline"},
     100: {"history": "2y",  "label": "100-Day · Macro Cycle Support"},
     200: {"history": "2y",  "label": "200-Day · Ultimate Bull/Bear Line"},
 }
 
-# Fibonacci retracement ratios used in Elliott Wave analysis
 FIB_RATIOS = {
-    "78.6%": 0.786,
-    "61.8%": 0.618,
-    "50.0%": 0.500,
-    "38.2%": 0.382,
-    "23.6%": 0.236,
+    "78.6%": 0.786, "61.8%": 0.618,
+    "50.0%": 0.500, "38.2%": 0.382, "23.6%": 0.236,
 }
 FIB_COLORS = {
-    "78.6%": "rgba(255,82,82,0.55)",
-    "61.8%": "rgba(255,167,38,0.65)",
-    "50.0%": "rgba(255,238,88,0.60)",
-    "38.2%": "rgba(102,187,106,0.65)",
+    "78.6%": "rgba(255,82,82,0.55)",   "61.8%": "rgba(255,167,38,0.65)",
+    "50.0%": "rgba(255,238,88,0.60)",  "38.2%": "rgba(102,187,106,0.65)",
     "23.6%": "rgba(79,195,247,0.55)",
 }
 
+# Browser-like headers to avoid 403 blocks from Wikipedia/financial sites
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
 # ================================================================
-# INDICATOR & ELLIOTT WAVE EDUCATION PANEL
+# INDICATOR + ELLIOTT WAVE EDUCATION PANEL
 # ================================================================
 def render_indicator_guide():
     with st.expander(
@@ -137,111 +130,82 @@ def render_indicator_guide():
         c1, c2, c3 = st.columns(3)
 
         with c1:
-            st.markdown("---")
-            st.markdown("### 📈  Moving Average (SMA / WMA)")
+            st.markdown("---\n### 📈 Moving Average (SMA / WMA)")
             st.info(
-                "**What it is:** The average closing price over N days. "
-                "SMA weights every day equally; WMA gives more weight to recent days.\n\n"
-                "**Think of it as:** The stock's center of gravity. Prices drift back toward "
-                "it over time. When price punches above, buyers are in control.\n\n"
-                "🔺 Green triangle = price just crossed above → Buy signal\n"
-                "🔻 Red triangle   = price just crossed below → Sell signal"
+                "**What it is:** Average closing price over N days. SMA weights every day equally; "
+                "WMA gives more weight to recent days.\n\n"
+                "**Think of it as:** The stock's center of gravity — prices drift back toward it.\n\n"
+                "🔺 Green triangle = crossed above → Buy signal\n"
+                "🔻 Red triangle   = crossed below → Sell signal"
             )
-
-            st.markdown("---")
-            st.markdown("### 📉  RSI — Relative Strength Index")
+            st.markdown("---\n### 📉 RSI — Relative Strength Index")
             st.info(
-                "**What it is:** A 0–100 speed gauge measuring how aggressively price "
-                "has moved over the last 14 days.\n\n"
-                "**Think of it as:** A runner's fatigue meter. Sprinting too long (>70) "
-                "leads to a slowdown. Crawling exhausted (<30) often precedes a burst.\n\n"
-                "🔴 Above 70 = Overbought — pullback risk\n"
-                "🟢 Below 30 = Oversold   — bounce candidate\n"
-                "⚪ 30–70    = Neutral territory"
+                "**What it is:** A 0–100 speed gauge for recent price movement (14-day).\n\n"
+                "**Think of it as:** A runner's fatigue meter. Sprinting too long (>70) leads to "
+                "a slowdown. Crawling exhausted (<30) precedes a burst.\n\n"
+                "🔴 Above 70 = Overbought\n🟢 Below 30 = Oversold\n⚪ 30–70 = Neutral"
             )
-
-            st.markdown("---")
-            st.markdown("### 📊  Volume")
+            st.markdown("---\n### 📊 Volume")
             st.info(
-                "**What it is:** Total shares traded in a session. Validates whether "
-                "a price move has real conviction.\n\n"
-                "**Think of it as:** Votes. A rise on heavy volume = thousands agree. "
-                "A rise on thin volume = easy to reverse.\n\n"
-                "🟢 Rising price + High volume = Strong confirmed move\n"
-                "🔴 Rising price + Low volume  = Weak, suspect move"
+                "**What it is:** Total shares traded. Validates whether a move has real conviction.\n\n"
+                "**Think of it as:** Votes. Rising price + heavy volume = many investors agree.\n\n"
+                "🟢 Rising price + High volume = Confirmed move\n"
+                "🔴 Rising price + Low volume  = Suspect move"
             )
 
         with c2:
-            st.markdown("---")
-            st.markdown("### ⚡  MACD")
+            st.markdown("---\n### ⚡ MACD")
             st.info(
-                "**What it is:** Compares a fast (12-day) EMA to a slow (26-day) EMA. "
-                "The gap between them is the MACD line, plotted against a 9-day signal line.\n\n"
-                "**Think of it as:** Two pace cars. When the fast car pulls ahead of the "
-                "slow one (MACD crosses above Signal), buying acceleration is building.\n\n"
-                "🟢 MACD above Signal  = Bullish momentum\n"
-                "🔴 MACD below Signal  = Bearish momentum\n"
-                "📊 Histogram growing  = Momentum strengthening"
+                "**What it is:** Compares fast (12-day) vs slow (26-day) EMA. Gap = MACD line, "
+                "plotted vs a 9-day signal line.\n\n"
+                "**Think of it as:** Two pace cars — when the fast car leads, buyers are accelerating.\n\n"
+                "🟢 MACD above Signal = Bullish\n🔴 MACD below Signal = Bearish\n"
+                "📊 Histogram growing = Momentum strengthening"
             )
-
-            st.markdown("---")
-            st.markdown("### 🎯  Bollinger Bands")
+            st.markdown("---\n### 🎯 Bollinger Bands")
             st.info(
-                "**What it is:** Three lines — a 20-day MA centre flanked by upper/lower "
-                "bands 2 standard deviations away. Bands widen on high volatility, "
+                "**What it is:** 20-day MA ± 2 standard deviations. Bands widen on volatility, "
                 "narrow on calm markets.\n\n"
-                "**Think of it as:** Highway lane markers. Price drifts to the edge then "
-                "snaps back. Narrow bands = big move loading.\n\n"
-                "🔴 At upper band = Potentially overbought\n"
-                "🟢 At lower band = Potentially oversold\n"
-                "⚠️  Squeeze        = Breakout incoming"
+                "**Think of it as:** Highway lanes — price drifts to edge then snaps back.\n\n"
+                "🔴 At upper band = Overbought\n🟢 At lower band = Oversold\n"
+                "⚠️  Squeeze = Big move loading"
             )
-
-            st.markdown("---")
-            st.markdown("### 🔀  Reading Indicators Together")
+            st.markdown("---\n### 👔 Insider / CEO Buying")
             st.info(
-                "**Strongest buy setup (confluence):**\n"
-                "- Price crosses above MA 🔺\n"
-                "- RSI between 40–60 (room to run)\n"
-                "- MACD just crossed above Signal\n"
-                "- High volume on the breakout day\n"
-                "- Price bouncing off lower BB or key Fibonacci level\n\n"
-                "The more signals agree, the higher the conviction. "
-                "The AI report synthesises all of this automatically."
+                "**What it is:** Purchases of company stock by executives, directors, or major "
+                "shareholders — reported publicly via SEC Form 4 filings.\n\n"
+                "**Think of it as:** The strongest vote of confidence possible. When a CEO buys "
+                "$1M of their own stock with personal money, they're telling you something the "
+                "news isn't.\n\n"
+                "🟢 CEO / multiple officers buying = Very bullish signal\n"
+                "🔴 Heavy insider selling = Caution warranted\n"
+                "📌 Cluster buying (3+ insiders at once) = Highest conviction signal"
             )
 
         with c3:
-            st.markdown("---")
-            st.markdown("### 🌊  Elliott Wave Theory")
+            st.markdown("---\n### 🌊 Elliott Wave Theory")
             st.info(
-                "**What it is:** A framework that says markets move in predictable "
-                "wave patterns driven by crowd psychology — repeating cycles of "
-                "optimism and pessimism.\n\n"
-                "**The basic pattern:**\n"
+                "**What it is:** Markets move in predictable wave patterns driven by crowd psychology.\n\n"
+                "**The pattern:**\n"
                 "- **Wave 1** — First move up; few notice\n"
                 "- **Wave 2** — Pullback; 'Was that it?'\n"
-                "- **Wave 3** — Strongest surge; news turns bullish\n"
+                "- **Wave 3** — Strongest surge; euphoria builds\n"
                 "- **Wave 4** — Mild dip; bulls buy the dip\n"
-                "- **Wave 5** — Final push; euphoria peaks\n"
+                "- **Wave 5** — Final push; peak optimism\n"
                 "- **Wave A–C** — Corrective phase follows\n\n"
-                "The AI analysis identifies the likely current wave position."
+                "The AI identifies the likely current wave position."
             )
-
-            st.markdown("---")
-            st.markdown("### 📐  Fibonacci Retracement Levels")
+            st.markdown("---\n### 📐 Fibonacci Retracement Levels")
             st.info(
-                "**What it is:** Key price zones derived from the Fibonacci sequence "
-                "(the same ratio found in nature, art, and architecture). Markets tend "
-                "to reverse or pause at these exact levels — traders actively watch them.\n\n"
-                "**The key levels on every chart:**\n"
+                "**What it is:** Key price zones from the Fibonacci sequence — the same ratio "
+                "found throughout nature. Markets tend to reverse at these exact levels.\n\n"
                 "🔵 **23.6%** — Shallow pullback, strong trend\n"
-                "🟢 **38.2%** — Common retracement, healthy dip\n"
-                "🟡 **50.0%** — Psychological midpoint, watch closely\n"
-                "🟠 **61.8%** — The 'Golden Ratio', strongest support\n"
+                "🟢 **38.2%** — Common healthy dip\n"
+                "🟡 **50.0%** — Psychological midpoint\n"
+                "🟠 **61.8%** — The Golden Ratio — strongest support\n"
                 "🔴 **78.6%** — Deep retracement, trend may be weakening\n\n"
-                "**How to use:** After a big move up, price often pulls back to one "
-                "of these levels before continuing. A bounce off 61.8% in an uptrend "
-                "is one of the highest-probability trade setups in all of technical analysis."
+                "A bounce off the 61.8% level in an uptrend is one of the highest-probability "
+                "setups in all of technical analysis."
             )
 
 # ================================================================
@@ -273,11 +237,8 @@ def save_position_to_db(user_id, pin, ticker, shares, cost) -> bool:
               .eq("user_id", user_id).eq("ticker", ticker).execute()
         else:
             db.table("portfolios").upsert({
-                "user_id":  user_id,
-                "pin_hash": hash_pin(pin),
-                "ticker":   ticker,
-                "shares":   shares,
-                "cost":     cost,
+                "user_id": user_id, "pin_hash": hash_pin(pin),
+                "ticker": ticker, "shares": shares, "cost": cost,
             }, on_conflict="user_id,ticker").execute()
         return True
     except Exception as e:
@@ -285,16 +246,36 @@ def save_position_to_db(user_id, pin, ticker, shares, cost) -> bool:
         return False
 
 # ================================================================
-# TICKER UNIVERSE LOADERS  (lxml required — now in requirements.txt)
+# TICKER UNIVERSE LOADERS
+# FIX: Use browser headers + GitHub CSV primary source to avoid 403
 # ================================================================
+def _read_html_safe(url: str, **kwargs) -> list:
+    """pd.read_html via requests with browser headers to avoid 403."""
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return pd.read_html(StringIO(r.text), **kwargs)
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_sp500_tickers() -> list:
+    # Primary: GitHub-hosted CSV (very reliable, no 403 risk)
     try:
-        table = pd.read_html(
+        url = (
+            "https://raw.githubusercontent.com/datasets/"
+            "s-and-p-500-companies/main/data/constituents.csv"
+        )
+        df = pd.read_csv(url)
+        tickers = sorted(df["Symbol"].str.replace(".", "-", regex=False).tolist())
+        if len(tickers) > 400:
+            return tickers
+    except Exception:
+        pass
+    # Fallback: Wikipedia via requests with browser headers
+    try:
+        tables = _read_html_safe(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
             flavor="lxml"
-        )[0]
-        return sorted(table["Symbol"].str.replace(".", "-", regex=False).tolist())
+        )
+        return sorted(tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist())
     except Exception as e:
         st.warning(f"S&P 500 list fetch failed: {e}")
         return []
@@ -307,8 +288,8 @@ def get_sp1500_tickers() -> list:
         ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "Ticker"),
     ]:
         try:
-            df = pd.read_html(url, flavor="lxml")[0]
-            tickers.update(df[col].str.replace(".", "-", regex=False).tolist())
+            tables = _read_html_safe(url, flavor="lxml")
+            tickers.update(tables[0][col].str.replace(".", "-", regex=False).tolist())
         except Exception:
             pass
     return sorted(list(tickers))
@@ -320,46 +301,39 @@ def get_russell2000_tickers() -> list:
             "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf"
             "/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
         )
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        r  = requests.get(url, headers=headers, timeout=20)
-        from io import StringIO
+        r  = requests.get(url, headers=HEADERS, timeout=20)
         df = pd.read_csv(StringIO(r.text), skiprows=9)
         df = df[df.get("Asset Class", df.columns[0]) == "Equity"]
-        tickers = df["Ticker"].dropna().str.strip().tolist()
-        valid   = sorted([t for t in tickers if t and t != "-" and len(t) <= 6])
+        valid = sorted([
+            t for t in df["Ticker"].dropna().str.strip().tolist()
+            if t and t != "-" and len(t) <= 6
+        ])
         if len(valid) > 500:
             return valid
     except Exception:
         pass
     try:
-        df = pd.read_html(
+        tables = _read_html_safe(
             "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", flavor="lxml"
-        )[0]
+        )
         st.caption("ℹ️ Russell 2000 live feed unavailable — using S&P SmallCap 600 as proxy.")
-        return sorted(df["Ticker"].str.replace(".", "-", regex=False).tolist())
+        return sorted(tables[0]["Ticker"].str.replace(".", "-", regex=False).tolist())
     except Exception:
-        st.warning("Russell 2000 data unavailable. Try S&P 500.")
+        st.warning("Russell 2000 unavailable. Try S&P 500.")
         return []
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_all_us_equities() -> list:
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept":     "application/json, text/plain, */*",
-        }
-        url = (
-            "https://api.nasdaq.com/api/screener/stocks"
-            "?tableonly=true&limit=5000&offset=0&download=true"
+        r    = requests.get(
+            "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=5000&download=true",
+            headers=HEADERS, timeout=25
         )
-        r    = requests.get(url, headers=headers, timeout=25)
-        data = r.json()
-        df   = pd.DataFrame(data["data"]["rows"])
+        df   = pd.DataFrame(r.json()["data"]["rows"])
         df["volume"] = pd.to_numeric(
             df["volume"].astype(str).str.replace(",", "", regex=False), errors="coerce"
         )
-        df = df[df["volume"] > 500_000]
-        tickers = sorted(df["symbol"].str.strip().tolist())
+        tickers = sorted(df[df["volume"] > 500_000]["symbol"].str.strip().tolist())
         if len(tickers) > 100:
             return tickers
     except Exception:
@@ -368,16 +342,93 @@ def get_all_us_equities() -> list:
     return get_sp1500_tickers()
 
 # ================================================================
-# CORE TECHNICAL ANALYSIS ENGINE  (+ Fibonacci retracement)
+# INSIDER TRANSACTION DATA
+# ================================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def get_insider_transactions(symbol: str) -> pd.DataFrame | None:
+    """
+    Fetch insider buy/sell transactions via yfinance.
+    Returns cleaned DataFrame or None if unavailable.
+    """
+    try:
+        df = yf.Ticker(symbol).insider_transactions
+        if df is None or df.empty:
+            return None
+        df = df.copy()
+        # Normalise date column
+        date_col = next((c for c in df.columns if "date" in c.lower()), None)
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+            cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=365)
+            df = df[df[date_col] >= cutoff]
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+def insider_summary(df: pd.DataFrame | None) -> str:
+    """One-line summary of insider activity for AI prompt context."""
+    if df is None:
+        return "No insider transaction data available."
+    tx_col = next((c for c in df.columns if "transaction" in c.lower() or "text" in c.lower()), None)
+    if tx_col:
+        buys  = df[df[tx_col].astype(str).str.contains("Buy|Purchase|Acquired", case=False, na=False)]
+        sells = df[df[tx_col].astype(str).str.contains("Sale|Sell|Disposed", case=False, na=False)]
+        return (
+            f"Insider activity (last 12 months): {len(buys)} purchase(s), "
+            f"{len(sells)} sale(s). "
+            + ("⚠️ Net insider selling dominates." if len(sells) > len(buys) * 2
+               else "✅ Net insider buying — positive signal." if len(buys) > 0
+               else "")
+        )
+    return "Insider data format unrecognised."
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_openinsider_cluster_buys() -> set:
+    """
+    Fetch tickers with recent cluster insider buying from OpenInsider.
+    Returns a set of uppercase ticker strings, or empty set on failure.
+    """
+    try:
+        r  = requests.get(
+            "https://openinsider.com/latest-cluster-buys",
+            headers=HEADERS, timeout=20
+        )
+        dfs = pd.read_html(StringIO(r.text), flavor="lxml")
+        if dfs:
+            df = dfs[0]
+            # Find the ticker column
+            col = next(
+                (c for c in df.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower()),
+                df.columns[2] if len(df.columns) > 2 else None
+            )
+            if col:
+                return set(df[col].dropna().astype(str).str.upper().str.strip().tolist())
+    except Exception:
+        pass
+    return set()
+
+# ================================================================
+# PERFORMANCE CACHE — raw yfinance history
+# FIX: Cache prevents redundant network calls on portfolio reloads
+# ================================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_history(symbol: str, period: str) -> pd.DataFrame:
+    try:
+        return yf.Ticker(symbol).history(period=period)
+    except Exception:
+        return pd.DataFrame()
+
+# ================================================================
+# CORE TECHNICAL ANALYSIS ENGINE
 # ================================================================
 def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
     """
-    Returns (is_bullish, metrics, plotly_fig, current_price, fib_levels)
+    Returns: (is_bullish, metrics, fig, current_price, fib_levels)
+    Uses cached history for performance.
     """
     try:
-        ticker   = yf.Ticker(symbol)
         lookback = INTERVAL_MAP[period_window]["history"]
-        hist     = ticker.history(period=lookback)
+        hist     = _cached_history(symbol, lookback)   # ← cached
 
         min_bars = max(period_window, 26, 20) + 5
         if hist.empty or len(hist) < min_bars:
@@ -385,7 +436,7 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
 
         close = hist["Close"]
 
-        # ── Moving Average ─────────────────────────────────────
+        # Moving Average
         if "Simple" in calc_type:
             hist["MA"] = close.rolling(period_window).mean()
             ma_label   = f"SMA-{period_window}"
@@ -396,28 +447,27 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
             )
             ma_label   = f"WMA-{period_window}"
 
-        # ── Bollinger Bands (20-day ±2σ) ──────────────────────
+        # Bollinger Bands
         bb_mid           = close.rolling(20).mean()
         bb_std           = close.rolling(20).std()
         hist["BB_Upper"] = bb_mid + 2 * bb_std
         hist["BB_Mid"]   = bb_mid
         hist["BB_Lower"] = bb_mid - 2 * bb_std
 
-        # ── RSI (14-period) ────────────────────────────────────
+        # RSI
         delta       = close.diff()
         gain        = delta.clip(lower=0).rolling(14).mean()
         loss        = (-delta.clip(upper=0)).rolling(14).mean()
-        rs          = gain / loss.replace(0, np.nan)
-        hist["RSI"] = 100 - (100 / (1 + rs))
+        hist["RSI"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-        # ── MACD (12, 26, 9) ───────────────────────────────────
+        # MACD
         ema12            = close.ewm(span=12, adjust=False).mean()
         ema26            = close.ewm(span=26, adjust=False).mean()
         hist["MACD"]     = ema12 - ema26
         hist["MACD_Sig"] = hist["MACD"].ewm(span=9, adjust=False).mean()
         hist["MACD_H"]   = hist["MACD"] - hist["MACD_Sig"]
 
-        # ── Fibonacci Retracement (Elliott Wave anchor) ────────
+        # Fibonacci retracement
         swing_high = float(close.max())
         swing_low  = float(close.min())
         diff       = swing_high - swing_low
@@ -426,7 +476,7 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
             for label, ratio in FIB_RATIOS.items()
         }
 
-        # ── MA Crossover Signals ───────────────────────────────
+        # MA crossover signals
         prev_close   = close.shift(1)
         prev_ma      = hist["MA"].shift(1)
         hist["Buy"]  = np.where(
@@ -436,28 +486,26 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
             (close < hist["MA"]) & (prev_close >= prev_ma), close, np.nan
         )
 
-        # ── Snapshot Values ────────────────────────────────────
-        cur_price  = float(close.iloc[-1])
-        cur_ma     = float(hist["MA"].iloc[-1])
-        cur_rsi    = float(hist["RSI"].iloc[-1])
-        cur_macd   = float(hist["MACD"].iloc[-1])
-        cur_sig    = float(hist["MACD_Sig"].iloc[-1])
-        cur_bbu    = float(hist["BB_Upper"].iloc[-1])
-        cur_bbl    = float(hist["BB_Lower"].iloc[-1])
-        prior      = close.iloc[-20] if len(hist) >= 20 else close.iloc[0]
-        momentum   = ((cur_price - float(prior)) / float(prior)) * 100
-        avg_vol    = float(hist["Volume"].rolling(20).mean().iloc[-1])
-        last_vol   = float(hist["Volume"].iloc[-1])
-        vol_ratio  = last_vol / avg_vol if avg_vol > 0 else 1.0
+        # Snapshot metrics
+        cur_price = float(close.iloc[-1])
+        cur_ma    = float(hist["MA"].iloc[-1])
+        cur_rsi   = float(hist["RSI"].iloc[-1])
+        cur_macd  = float(hist["MACD"].iloc[-1])
+        cur_sig   = float(hist["MACD_Sig"].iloc[-1])
+        cur_bbu   = float(hist["BB_Upper"].iloc[-1])
+        cur_bbl   = float(hist["BB_Lower"].iloc[-1])
+        prior     = close.iloc[-20] if len(hist) >= 20 else close.iloc[0]
+        momentum  = ((cur_price - float(prior)) / float(prior)) * 100
+        avg_vol   = float(hist["Volume"].rolling(20).mean().iloc[-1])
+        last_vol  = float(hist["Volume"].iloc[-1])
+        vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
 
-        # ── Nearest Fib level to current price ────────────────
-        nearest_fib = min(fib_levels.items(), key=lambda x: abs(x[1] - cur_price))
+        nearest_fib  = min(fib_levels.items(), key=lambda x: abs(x[1] - cur_price))
         fib_distance = ((cur_price - nearest_fib[1]) / nearest_fib[1]) * 100
 
-        # ── Signal Labels ──────────────────────────────────────
+        # Signal labels
         buys  = hist["Buy"].dropna()
         sells = hist["Sell"].dropna()
-
         if not buys.empty and (sells.empty or buys.index[-1] > sells.index[-1]):
             ma_signal  = f"🟢 BUY  ({buys.index[-1].strftime('%m/%d')})"
             is_bullish = True
@@ -468,37 +516,31 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
             ma_signal  = "⚪ Neutral"
             is_bullish = momentum > 0
 
-        rsi_label  = (
-            "🔴 Overbought (>70)" if cur_rsi > 70 else
-            "🟢 Oversold  (<30)" if cur_rsi < 30 else "⚪ Neutral"
-        )
-        macd_label = "🟢 Bullish cross" if cur_macd > cur_sig else "🔴 Bearish cross"
-        bb_label   = (
-            "🔴 At upper band" if cur_price >= cur_bbu * 0.99 else
-            "🟢 At lower band" if cur_price <= cur_bbl * 1.01 else "⚪ Within bands"
-        )
-        vol_label  = (
-            "🟢 High volume"  if vol_ratio > 1.5 else
-            "🔴 Light volume" if vol_ratio < 0.5 else "⚪ Average volume"
-        )
-        fib_label  = (
-            f"📐 Near {nearest_fib[0]} (${nearest_fib[1]:.2f}) — "
-            f"{'above' if fib_distance > 0 else 'below'} by {abs(fib_distance):.1f}%"
-        )
-
         metrics = {
-            "Price":             f"${cur_price:.2f}",
-            "1-Mo Momentum":     f"{momentum:+.1f}%",
-            f"{ma_label}":       f"${cur_ma:.2f}",
-            "MA Signal":         ma_signal,
-            "RSI (14)":          f"{cur_rsi:.1f} — {rsi_label}",
-            "MACD":              macd_label,
-            "Bollinger":         bb_label,
-            "Volume vs 20-avg":  f"{vol_ratio:.2f}x — {vol_label}",
-            "Fibonacci Zone":    fib_label,
+            "Price":            f"${cur_price:.2f}",
+            "1-Mo Momentum":    f"{momentum:+.1f}%",
+            f"{ma_label}":      f"${cur_ma:.2f}",
+            "MA Signal":        ma_signal,
+            "RSI (14)":         f"{cur_rsi:.1f} — " + (
+                "🔴 Overbought" if cur_rsi > 70 else
+                "🟢 Oversold"   if cur_rsi < 30 else "⚪ Neutral"
+            ),
+            "MACD":             "🟢 Bullish cross" if cur_macd > cur_sig else "🔴 Bearish cross",
+            "Bollinger":        (
+                "🔴 At upper band" if cur_price >= cur_bbu * 0.99 else
+                "🟢 At lower band" if cur_price <= cur_bbl * 1.01 else "⚪ Within bands"
+            ),
+            "Volume vs 20-avg": f"{vol_ratio:.2f}x — " + (
+                "🟢 High" if vol_ratio > 1.5 else
+                "🔴 Light" if vol_ratio < 0.5 else "⚪ Average"
+            ),
+            "Fibonacci Zone":   (
+                f"📐 Near {nearest_fib[0]} (${nearest_fib[1]:.2f}) — "
+                f"{'above' if fib_distance > 0 else 'below'} by {abs(fib_distance):.1f}%"
+            ),
         }
 
-        # ── Build Multi-Panel Chart ────────────────────────────
+        # ── Build chart ────────────────────────────────────────
         fig = make_subplots(
             rows=4, cols=1,
             shared_xaxes=True,
@@ -511,38 +553,30 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
                 "RSI  (14-period)  |  70 = Overbought · 30 = Oversold",
             ],
         )
-
-        # Bollinger Bands fill
+        # Bollinger fill
         fig.add_trace(go.Scatter(
-            x=hist.index, y=hist["BB_Upper"], name="BB Upper",
-            line=dict(color="rgba(120,120,255,0.35)", width=1), showlegend=False
+            x=hist.index, y=hist["BB_Upper"], showlegend=False,
+            line=dict(color="rgba(120,120,255,0.35)", width=1)
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=hist.index, y=hist["BB_Lower"], name="BB Lower",
-            fill="tonexty", fillcolor="rgba(120,120,255,0.07)",
-            line=dict(color="rgba(120,120,255,0.35)", width=1), showlegend=False
+            x=hist.index, y=hist["BB_Lower"], fill="tonexty",
+            fillcolor="rgba(120,120,255,0.07)", showlegend=False,
+            line=dict(color="rgba(120,120,255,0.35)", width=1)
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=hist.index, y=hist["BB_Mid"], name="BB Mid",
-            line=dict(color="rgba(180,180,255,0.4)", width=1, dash="dot"),
-            showlegend=False
+            x=hist.index, y=hist["BB_Mid"], showlegend=False,
+            line=dict(color="rgba(180,180,255,0.4)", width=1, dash="dot")
         ), row=1, col=1)
-
-        # Fibonacci horizontal lines (drawn before price so price sits on top)
+        # Fibonacci levels
         for label, level in fib_levels.items():
             fig.add_hline(
-                y=level,
-                line_dash="dot",
-                line_color=FIB_COLORS[label],
-                line_width=1.2,
+                y=level, line_dash="dot", line_color=FIB_COLORS[label], line_width=1.2,
                 annotation_text=f" Fib {label}  ${level:.2f}",
                 annotation_position="right",
-                annotation_font_size=9,
-                annotation_font_color=FIB_COLORS[label],
+                annotation_font_size=9, annotation_font_color=FIB_COLORS[label],
                 row=1, col=1
             )
-
-        # Price line + MA
+        # Price + MA + signals
         fig.add_trace(go.Scatter(
             x=hist.index, y=close, name="Price",
             line=dict(color="#4fc3f7", width=2)
@@ -551,20 +585,17 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
             x=hist.index, y=hist["MA"], name=ma_label,
             line=dict(color="#ffa726", width=1.8, dash="dot")
         ), row=1, col=1)
-
-        # Buy / Sell signal markers
         fig.add_trace(go.Scatter(
-            x=hist.index, y=hist["Buy"], mode="markers", name="BUY Signal",
+            x=hist.index, y=hist["Buy"], mode="markers", name="BUY",
             marker=dict(color="#4caf50", size=11, symbol="triangle-up",
                         line=dict(color="white", width=1))
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=hist.index, y=hist["Sell"], mode="markers", name="SELL Signal",
+            x=hist.index, y=hist["Sell"], mode="markers", name="SELL",
             marker=dict(color="#f44336", size=11, symbol="triangle-down",
                         line=dict(color="white", width=1))
         ), row=1, col=1)
-
-        # Volume bars
+        # Volume
         vol_colors = [
             "#4caf50" if float(c) >= float(o) else "#f44336"
             for c, o in zip(hist["Close"], hist["Open"])
@@ -573,12 +604,10 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
             x=hist.index, y=hist["Volume"],
             marker_color=vol_colors, showlegend=False
         ), row=2, col=1)
-
         # MACD
         hist_colors = ["#4caf50" if float(v) >= 0 else "#f44336" for v in hist["MACD_H"]]
         fig.add_trace(go.Bar(
-            x=hist.index, y=hist["MACD_H"],
-            marker_color=hist_colors, showlegend=False
+            x=hist.index, y=hist["MACD_H"], marker_color=hist_colors, showlegend=False
         ), row=3, col=1)
         fig.add_trace(go.Scatter(
             x=hist.index, y=hist["MACD"], name="MACD",
@@ -588,7 +617,6 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
             x=hist.index, y=hist["MACD_Sig"], name="Signal",
             line=dict(color="#ffa726", width=1.5, dash="dot")
         ), row=3, col=1)
-
         # RSI
         fig.add_trace(go.Scatter(
             x=hist.index, y=hist["RSI"], name="RSI",
@@ -596,31 +624,20 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
         ), row=4, col=1)
         for y_val, color in [(70, "rgba(244,67,54,0.55)"), (30, "rgba(76,175,80,0.55)")]:
             fig.add_hline(
-                y=y_val, line_dash="dash",
-                line_color=color, line_width=1.2,
-                row=4, col=1
+                y=y_val, line_dash="dash", line_color=color,
+                line_width=1.2, row=4, col=1
             )
-
         fig.update_layout(
-            template="plotly_dark",
-            hovermode="x unified",
-            height=820,
+            template="plotly_dark", hovermode="x unified", height=820,
             margin=dict(l=10, r=80, t=40, b=10),
-            legend=dict(
-                orientation="h", yanchor="bottom",
-                y=1.01, xanchor="right", x=1,
-                font=dict(size=11)
-            ),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(15,15,25,1)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1,
+                        font=dict(size=11)),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,15,25,1)",
         )
         fig.update_yaxes(title_text="Price ($)", row=1, col=1, gridcolor="#1e1e2e")
         fig.update_yaxes(title_text="Volume",   row=2, col=1, gridcolor="#1e1e2e")
         fig.update_yaxes(title_text="MACD",     row=3, col=1, gridcolor="#1e1e2e")
-        fig.update_yaxes(
-            title_text="RSI", range=[0, 100],
-            row=4, col=1, gridcolor="#1e1e2e"
-        )
+        fig.update_yaxes(title_text="RSI",      row=4, col=1, range=[0, 100], gridcolor="#1e1e2e")
 
         return is_bullish, metrics, fig, cur_price, fib_levels
 
@@ -628,95 +645,80 @@ def fetch_technical_data(symbol: str, period_window: int, calc_type: str):
         return False, {}, None, 0.0, {}
 
 # ================================================================
-# AI ANALYSIS — Gemini with automatic model fallback
+# AI ANALYSIS — Gemini with full model fallback chain
 # ================================================================
 def generate_ai_analysis(
-    symbol: str,
-    metrics: dict,
-    period: int,
-    method: str,
-    fib_levels: dict = None,
-    extra_context: str = ""
+    symbol: str, metrics: dict, period: int, method: str,
+    fib_levels: dict = None, extra_context: str = ""
 ) -> str:
     if not AI_AVAILABLE:
         return "⚠️ AI unavailable — GEMINI_API_KEY not found in secrets."
 
     fib_text = ""
     if fib_levels:
-        fib_text = "\nFibonacci Retracement Levels (full range of visible history):\n"
-        for label, price in fib_levels.items():
-            fib_text += f"  {label}: ${price:.2f}\n"
+        fib_text = "\nFibonacci Retracement Levels:\n" + "\n".join(
+            f"  {lbl}: ${lvl:.2f}" for lbl, lvl in fib_levels.items()
+        )
 
     prompt = f"""
-You are an elite institutional equity and crypto analyst with 20 years of Wall Street experience.
-A client — who may be a beginner — needs a professional analysis of {symbol}.
+You are an elite institutional equity and crypto analyst. Analyse {symbol} for a client 
+who may be a beginner — be clear and educational while maintaining professional depth.
+Define jargon the first time you use it.
 
-Live market data:
+Live Market Data:
 {json.dumps(metrics, indent=2)}
 {fib_text}
-Analysis framework: {period}-day {method}
-{f"Additional context: {extra_context}" if extra_context else ""}
+Framework: {period}-day {method}
+{f"Context: {extra_context}" if extra_context else ""}
 
-Write a structured institutional report with EXACTLY these five sections.
-Be clear enough for a novice but deep enough for a professional.
-Define any jargon the first time you use it.
-
----
+Produce a structured report with EXACTLY these five sections:
 
 ## 📋 Quantitative Tear Sheet
-A markdown table with columns: | Metric | Value | What It Means (plain English) |
-Include every metric provided above including Fibonacci levels.
-
----
+Markdown table: | Metric | Value | Plain-English Meaning |
+Include all metrics and Fibonacci levels above.
 
 ## 🌊 Elliott Wave & Trend Structure
-- Identify the most likely current Elliott Wave position (label each wave concept the first time)
-- Explain where price sits relative to the Fibonacci retracement levels above
-- State which Fibonacci level is acting as current support or resistance and why
-- Give specific price targets for the next wave up AND the key level that would invalidate the bullish case
-
----
+- Identify most likely current wave position (explain each wave term)
+- How price relates to each Fibonacci level shown
+- Which Fib level is acting as current support or resistance, and why
+- Specific price targets for next wave up AND the level that invalidates the bullish case
 
 ## 🔀 Multi-Indicator Confluence
-- Where RSI, MACD, Bollinger Bands, and Volume all agree: state the consensus
-- Where they conflict: explain the tension and which signal takes priority and why
-- Rate overall signal strength: Strong / Moderate / Weak with justification
-- One sentence summary a complete beginner can act on
-
----
+- Where RSI, MACD, Bollinger Bands, Volume, and any insider data agree
+- Where they conflict — which signal takes priority and why
+- Signal strength rating: Strong / Moderate / Weak with justification
+- One sentence a complete beginner can immediately act on
 
 ## ⚠️ Risk Assessment
 - Primary bull thesis risk
 - Primary bear thesis risk
-- Specific price level that invalidates the current setup
-- Suggested stop-loss zone (as a price range)
-
----
+- Price level that invalidates the setup
+- Suggested stop-loss zone (as a specific price range, not a concept)
 
 ## 🎯 Portfolio Strategy Suggestion
-**Bold and specific.** Include: action (buy/hold/sell/avoid), entry zone, target zone,
-stop-loss level, and position size tier (aggressive/moderate/conservative).
-End with one sentence summarising the risk/reward ratio.
+**Bold and specific:** action, entry zone, target zone, stop-loss, position size tier 
+(aggressive/moderate/conservative). End with one sentence summarising the risk/reward.
 """
 
-    # FIX: Try model candidates in order until one works
     errors = []
     for model in GEMINI_MODEL_CANDIDATES:
         try:
-            response = gemini_client.models.generate_content(
-                model=model, contents=prompt
-            )
-            return f"*Analysis generated using model: `{model}`*\n\n" + response.text
+            response = gemini_client.models.generate_content(model=model, contents=prompt)
+            return f"*Model: `{model}`*\n\n" + response.text
         except Exception as e:
-            errors.append(f"{model}: {e}")
+            errors.append(f"**{model}:** {str(e)[:120]}")
             continue
 
     return (
-        "⚠️ All Gemini models failed. Check that:\n"
-        "1. Your `GEMINI_API_KEY` is correct in Streamlit Secrets\n"
-        "2. The key has billing enabled at https://aistudio.google.com\n"
-        "3. You have access to at least one Gemini model\n\n"
-        f"**Errors tried:**\n" + "\n".join(f"- {e}" for e in errors)
+        "### ⚠️ All Gemini models failed\n\n"
+        "**Most likely cause: your API key is invalid or not being read from Secrets.**\n\n"
+        "**How to verify your key:**\n"
+        "1. Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)\n"
+        "2. Copy the key exactly — no quotes, no extra spaces\n"
+        "3. In Streamlit Community Cloud → your app → **Settings → Secrets**\n"
+        "4. The entry must be exactly: `GEMINI_API_KEY = \"your-key-here\"`\n"
+        "5. Save and wait ~30 seconds for the app to reload\n\n"
+        "**Errors tried:**\n" + "\n".join(f"- {e}" for e in errors)
     )
 
 # ================================================================
@@ -724,8 +726,8 @@ End with one sentence summarising the risk/reward ratio.
 # ================================================================
 def scan_tickers(ticker_list: list, period: int, calc_type: str, max_workers: int = 15):
     results, figs = [], {}
-    progress = st.progress(0.0, text="Preparing scan…")
-    total, done = len(ticker_list), 0
+    progress      = st.progress(0.0, text="Preparing scan…")
+    total, done   = len(ticker_list), 0
 
     def _scan_one(sym):
         return sym, *fetch_technical_data(sym, period, calc_type)
@@ -755,30 +757,143 @@ def display_metrics_grid(metrics: dict):
         for col, (k, v) in zip(cols, chunk):
             col.metric(k, v)
 
-def show_ai_report(report_key: str, symbol: str, metrics: dict,
-                   period: int, method: str, fib_levels: dict,
-                   context: str = "", button_label: str = "🤖  Generate AI Analyst Report"):
+def show_ai_report(
+    report_key: str, symbol: str, metrics: dict,
+    period: int, method: str, fib_levels: dict,
+    extra_context: str = "",            # FIX: consistent param name throughout
+    button_label: str = "🤖  Generate AI Analyst Report"
+):
     """
     FIX: Store AI output in session_state so it survives Streamlit reruns.
-    The report won't vanish when the user interacts with other widgets.
+    Report persists until user explicitly clears it.
     """
     if st.button(button_label, key=f"btn_{report_key}"):
-        with st.spinner("Gemini is analysing — this may take 20–40 seconds for Pro…"):
-            report = generate_ai_analysis(symbol, metrics, period, method, fib_levels, context)
-            st.session_state[f"report_{report_key}"] = report
+        with st.spinner("Gemini is analysing — may take 20–40 seconds for Pro…"):
+            report = generate_ai_analysis(
+                symbol, metrics, period, method, fib_levels, extra_context
+            )
+            st.session_state[f"rpt_{report_key}"] = report
 
-    if f"report_{report_key}" in st.session_state:
+    stored = st.session_state.get(f"rpt_{report_key}")
+    if stored:
         st.markdown("---")
-        st.markdown(st.session_state[f"report_{report_key}"])
-        if st.button("🗑️  Clear Report", key=f"clear_{report_key}"):
-            del st.session_state[f"report_{report_key}"]
+        st.markdown(stored)
+        if st.button("🗑️  Clear Report", key=f"clr_{report_key}"):
+            del st.session_state[f"rpt_{report_key}"]
             st.rerun()
+
+def render_insider_section(symbol: str):
+    """Display insider transaction table and summary for a given ticker."""
+    with st.expander("👔  Insider & Executive Transactions (last 12 months)", expanded=False):
+        with st.spinner("Loading insider data…"):
+            df = get_insider_transactions(symbol)
+        if df is None:
+            st.info(
+                "No recent insider transaction data found for this ticker. "
+                "This is common for ETFs, indices, and very small companies."
+            )
+            return
+        st.caption(
+            "Data sourced from SEC Form 4 filings via Yahoo Finance. "
+            "Purchases made with personal funds by insiders are the strongest vote of confidence."
+        )
+        # Colour-code the transaction column if present
+        tx_col = next(
+            (c for c in df.columns if "transaction" in c.lower() or "text" in c.lower()),
+            None
+        )
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if tx_col:
+            buys  = df[df[tx_col].astype(str).str.contains("Buy|Purchase|Acqui", case=False, na=False)]
+            sells = df[df[tx_col].astype(str).str.contains("Sale|Sell|Dispos", case=False, na=False)]
+            c1, c2 = st.columns(2)
+            c1.metric("Insider Purchases (12mo)", len(buys),
+                      delta="Bullish" if len(buys) > 0 else None)
+            c2.metric("Insider Sales (12mo)", len(sells),
+                      delta="Caution" if len(sells) > len(buys) else None,
+                      delta_color="inverse" if len(sells) > 0 else "normal")
+
+# ================================================================
+# PORTFOLIO DIVERSITY CHART
+# Adaptive: donut for ≤8 positions, treemap for 9+
+# ================================================================
+def render_diversity_chart(rows: list, total_value: float):
+    if not rows or total_value == 0:
+        return
+
+    labels, values = [], []
+    for row in rows:
+        val = float(
+            row.get("Mkt Value", "$0").replace("$", "").replace(",", "")
+        )
+        if val > 0:
+            labels.append(row["Asset"])
+            values.append(val)
+
+    if not values:
+        return
+
+    n = len(values)
+    st.subheader("📊  Portfolio Diversity")
+
+    if n <= 8:
+        # Donut chart — clean for small portfolios
+        pct_labels = [f"{l}<br>{v/total_value*100:.1f}%" for l, v in zip(labels, values)]
+        fig = go.Figure(data=[go.Pie(
+            labels=labels,
+            values=values,
+            hole=0.45,
+            text=pct_labels,
+            textinfo="label+percent" if n <= 4 else "percent",
+            hovertemplate="<b>%{label}</b><br>Value: $%{value:,.2f}<br>Share: %{percent}<extra></extra>",
+            marker=dict(line=dict(color="#0f0f19", width=2)),
+        )])
+        fig.update_layout(
+            template="plotly_dark",
+            showlegend=(n > 4),
+            height=380,
+            margin=dict(l=20, r=20, t=10, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            annotations=[dict(
+                text=f"<b>${total_value:,.0f}</b>",
+                x=0.5, y=0.5, font_size=15, showarrow=False,
+                font=dict(color="#4fc3f7")
+            )],
+        )
+    else:
+        # Treemap — handles many positions cleanly
+        df_chart = pd.DataFrame({"Asset": labels, "Value": values})
+        df_chart["Pct"] = df_chart["Value"] / total_value * 100
+        fig = go.Figure(go.Treemap(
+            labels=df_chart["Asset"],
+            parents=[""] * len(df_chart),
+            values=df_chart["Value"],
+            texttemplate="<b>%{label}</b><br>%{customdata:.1f}%",
+            customdata=df_chart["Pct"],
+            hovertemplate="<b>%{label}</b><br>$%{value:,.2f}<br>%{customdata:.1f}%<extra></extra>",
+            marker=dict(
+                colorscale="Blues",
+                line=dict(width=2, color="#0f0f19"),
+            ),
+        ))
+        fig.update_layout(
+            template="plotly_dark",
+            height=380,
+            margin=dict(l=10, r=10, t=10, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 # ================================================================
 # MAIN APP
 # ================================================================
 st.title("📊  Wall Street AI Dashboard")
-st.caption("Institutional-grade analysis · Gemini 2.5 Pro · Elliott Wave · Fibonacci · Real-time data")
+st.caption(
+    "Institutional-grade analysis · Gemini 2.5 Pro · "
+    "Elliott Wave · Fibonacci · Insider Activity · Real-time data"
+)
 
 render_indicator_guide()
 st.divider()
@@ -789,33 +904,35 @@ with st.sidebar:
     ma_type = st.radio(
         "Moving Average Type",
         ["Simple Moving Average (SMA)", "Weighted Moving Average (WMA)"],
-        help="WMA reacts faster to recent price. SMA is smoother."
+        help="WMA reacts faster. SMA is smoother."
     )
     sma_period = st.selectbox(
         "Lookback Period",
-        options=list(INTERVAL_MAP.keys()),
-        index=1,
+        options=list(INTERVAL_MAP.keys()), index=1,
         format_func=lambda x: INTERVAL_MAP[x]["label"],
-        help="Longer = slower signals, fewer false alarms. Shorter = faster but noisier."
     )
     st.divider()
+
+    # API key status
     if not AI_AVAILABLE:
-        st.error("⚠️ GEMINI_API_KEY not in secrets — AI disabled.")
+        st.error("⚠️ GEMINI_API_KEY missing — AI disabled.")
+    elif len(GEMINI_API_KEY) < 20:
+        st.error("⚠️ GEMINI_API_KEY looks too short — check Secrets.")
     else:
-        st.success("✅ Gemini AI connected")
+        masked = GEMINI_API_KEY[:6] + "•" * 8 + GEMINI_API_KEY[-4:]
+        st.success(f"✅ Gemini key loaded: `{masked}`")
+
     if SUPABASE_AVAILABLE:
         st.success("✅ Cloud portfolio connected")
     else:
-        st.warning("⚠️ Supabase not configured — portfolios won't persist")
+        st.warning("⚠️ Supabase not set — portfolios won't persist")
     st.divider()
     st.caption("🔒 Shared institutional API — no personal key needed.")
 
-# ── Mode Selector ────────────────────────────────────────────────
+# ── Mode selector ────────────────────────────────────────────────
 mode = st.radio(
-    "Mode",
-    ["💼  My Portfolio", "🔍  Analyze Single Asset", "🌐  Market Scanner"],
-    horizontal=True,
-    label_visibility="collapsed"
+    "Mode", ["💼  My Portfolio", "🔍  Analyze Single Asset", "🌐  Market Scanner"],
+    horizontal=True, label_visibility="collapsed"
 )
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -834,7 +951,7 @@ if mode == "💼  My Portfolio":
     # Login
     if SUPABASE_AVAILABLE and "auth_user" not in st.session_state:
         st.subheader("🔐  Access Your Portfolio")
-        st.caption("New users: choose any username and PIN to create your account automatically.")
+        st.caption("First time? Choose any username and 4-digit PIN to create your account.")
         with st.form("login_form"):
             uid       = st.text_input("Username / Investor ID", placeholder="e.g. john_trader")
             pin       = st.text_input("4-Digit PIN", type="password", max_chars=4)
@@ -851,9 +968,9 @@ if mode == "💼  My Portfolio":
                 if portfolio is None:
                     st.error("❌ Incorrect PIN for this username.")
                 else:
-                    st.session_state["auth_user"]      = uid
-                    st.session_state["auth_pin"]       = pin
-                    st.session_state["user_portfolio"] = portfolio
+                    st.session_state.update({
+                        "auth_user": uid, "auth_pin": pin, "user_portfolio": portfolio
+                    })
                     st.rerun()
         st.stop()
 
@@ -864,32 +981,30 @@ if mode == "💼  My Portfolio":
             st.caption(f"Logged in as: **{st.session_state.get('auth_user','—')}**")
 
         with st.form("position_form"):
-            # FIX: Asset type toggle prevents ETH (stock) vs ETH-USD (crypto) confusion
+            # FIX: Stock/Crypto toggle prevents ETH vs ETH-USD confusion
             asset_type = st.radio(
-                "Asset Type",
-                ["📈 Stock", "₿ Crypto"],
-                horizontal=True,
-                help="Select Crypto to auto-format the ticker (e.g. ETH → ETH-USD)"
+                "Asset Type", ["📈 Stock", "₿ Crypto"], horizontal=True,
+                help="Crypto auto-appends -USD (e.g. ETH → ETH-USD)"
             )
             raw_ticker = st.text_input(
                 "Ticker Symbol",
                 placeholder="Stock: AAPL  |  Crypto: ETH or ETH-USD"
             ).upper().strip()
+            # FIX: 8 decimal places for small crypto positions (e.g. 0.002 BTC)
             new_shares = st.number_input(
-                "Shares / Units Owned", min_value=0.0, step=0.001,
-                help="Set to 0 to remove this position."
+                "Shares / Units Owned", min_value=0.0,
+                step=0.00000001, format="%.8f",
+                help="Supports up to 8 decimal places for crypto (e.g. 0.00250000 BTC)"
             )
-            new_cost   = st.number_input(
+            new_cost = st.number_input(
                 "Average Purchase Price ($)", min_value=0.0, step=0.01
             )
-            save_btn   = st.form_submit_button("💾  Save Position", use_container_width=True)
+            save_btn = st.form_submit_button("💾  Save Position", use_container_width=True)
 
         if save_btn and raw_ticker:
-            # Auto-append -USD for crypto if not already present
-            if "Crypto" in asset_type:
-                new_ticker = raw_ticker if raw_ticker.endswith("-USD") else raw_ticker + "-USD"
-            else:
-                new_ticker = raw_ticker
+            new_ticker = (
+                raw_ticker if raw_ticker.endswith("-USD") else raw_ticker + "-USD"
+            ) if "Crypto" in asset_type else raw_ticker
 
             uid = st.session_state.get("auth_user", "local")
             pin = st.session_state.get("auth_pin", "")
@@ -910,10 +1025,9 @@ if mode == "💼  My Portfolio":
         st.divider()
         if st.session_state.get("user_portfolio"):
             st.download_button(
-                "📥  Download Portfolio Backup",
+                "📥  Download Backup",
                 data=json.dumps(st.session_state["user_portfolio"]),
-                file_name="portfolio_backup.json",
-                mime="application/json",
+                file_name="portfolio_backup.json", mime="application/json",
                 use_container_width=True
             )
         uploaded = st.file_uploader("📤  Restore from Backup", type="json")
@@ -936,14 +1050,14 @@ if mode == "💼  My Portfolio":
 
     if not portfolio:
         st.info(
-            "Your portfolio is empty. Use the **Position Manager** in the sidebar. "
-            "For crypto, select the ₿ Crypto toggle before entering the symbol."
+            "Portfolio is empty. Use the **Position Manager** in the sidebar. "
+            "Select ₿ Crypto before entering ETH, BTC, XRP etc."
         )
     else:
         total_value = total_cost = 0.0
         rows, charts = [], {}
 
-        with st.spinner("Fetching live quotes and calculating all indicators…"):
+        with st.spinner("Fetching live data — using 5-min cache for speed…"):
             for sym, pos in list(portfolio.items()):
                 _, metrics, fig, price, fib = fetch_technical_data(sym, sma_period, ma_type)
                 if price > 0:
@@ -954,10 +1068,10 @@ if mode == "💼  My Portfolio":
                     total_value += pos_value
                     total_cost  += pos_cost
                     if fig:
-                        charts[sym] = (fig, fib)
+                        charts[sym] = (fig, fib, metrics)
                     rows.append({
                         "Asset":         sym,
-                        "Shares":        f"{pos['shares']:.4f}",
+                        "Shares":        f"{pos['shares']:.8f}".rstrip("0").rstrip("."),
                         "Avg Cost":      f"${pos['cost']:.2f}",
                         "Current Price": f"${price:.2f}",
                         "Mkt Value":     f"${pos_value:,.2f}",
@@ -980,41 +1094,49 @@ if mode == "💼  My Portfolio":
         st.subheader("Holdings Summary")
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+        # Adaptive diversity chart
+        render_diversity_chart(rows, total_value)
+
         st.subheader("📈  Deep-Dive Chart & AI Analysis")
         chosen = st.selectbox("Select a holding", list(portfolio.keys()))
 
         if chosen in charts:
-            fig, fib = charts[chosen]
+            fig, fib, chosen_metrics = charts[chosen]
             st.plotly_chart(fig, use_container_width=True)
-            chosen_metrics = next((r for r in rows if r["Asset"] == chosen), {})
-            pos_detail     = portfolio.get(chosen, {})
-            context        = (
-                f"Held position: {pos_detail.get('shares',0):.4f} units "
-                f"at ${pos_detail.get('cost',0):.2f} avg cost. "
-                f"Current P&L: {chosen_metrics.get('Return (%)', 'unknown')}."
+
+            # Insider activity for chosen stock
+            if not chosen.endswith("-USD"):   # skip for crypto
+                render_insider_section(chosen)
+
+            pos_detail = portfolio.get(chosen, {})
+            ins_df     = get_insider_transactions(chosen) if not chosen.endswith("-USD") else None
+            context    = (
+                f"Held position: {pos_detail.get('shares',0):.8f} units at "
+                f"${pos_detail.get('cost',0):.2f} avg cost. "
+                f"Current P&L: {next((r['Return (%)'] for r in rows if r['Asset']==chosen),'unknown')}. "
+                f"{insider_summary(ins_df)}"
             )
             show_ai_report(
                 f"portfolio_{chosen}", chosen, chosen_metrics,
-                sma_period, ma_type, fib, context
+                sma_period, ma_type, fib, extra_context=context
             )
         else:
-            st.warning("Chart unavailable — data may be insufficient for this asset.")
+            st.warning("Chart unavailable for this asset.")
 
 # ================================================================
 # MODE 2 — SINGLE ASSET ANALYSIS
 # ================================================================
 elif mode == "🔍  Analyze Single Asset":
     st.header("🔍  Single Asset Analysis")
-
     st.caption(
-        "Enter any US stock ticker or crypto symbol. "
-        "**Crypto format:** BTC-USD, ETH-USD, XRP-USD, SOL-USD"
+        "Any US stock or crypto. **Crypto format:** BTC-USD, ETH-USD, XRP-USD, SOL-USD"
     )
+
     c1, c2 = st.columns([4, 1])
     with c1:
         symbol_input = st.text_input(
             "Ticker", label_visibility="collapsed",
-            placeholder="Stock: NVDA, AAPL   |   Crypto: BTC-USD, ETH-USD, XRP-USD"
+            placeholder="Stock: NVDA, AAPL, TSLA   |   Crypto: BTC-USD, ETH-USD, XRP-USD"
         ).upper().strip()
     with c2:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -1028,15 +1150,25 @@ elif mode == "🔍  Analyze Single Asset":
 
         if fig is None or price == 0.0:
             st.error(
-                f"Could not retrieve data for **{symbol_input}**. "
-                "Check the ticker. Crypto must use the format `BTC-USD`, `ETH-USD`, etc."
+                f"No data for **{symbol_input}**. Check the ticker. "
+                "Crypto must use the format `BTC-USD`, `ETH-USD`, etc."
             )
         else:
             display_metrics_grid(metrics)
             st.plotly_chart(fig, use_container_width=True)
+
+            # Insider transactions (stocks only)
+            if not symbol_input.endswith("-USD"):
+                render_insider_section(symbol_input)
+
+            # AI report with insider context
+            ins_df  = get_insider_transactions(symbol_input) if not symbol_input.endswith("-USD") else None
+            context = insider_summary(ins_df)
+
             show_ai_report(
                 f"single_{symbol_input}", symbol_input, metrics,
                 sma_period, ma_type, fib,
+                extra_context=context,
                 button_label="🤖  Generate Full AI Report"
             )
 
@@ -1046,34 +1178,43 @@ elif mode == "🔍  Analyze Single Asset":
 elif mode == "🌐  Market Scanner":
     st.header("🌐  Market Scanner")
     st.caption(
-        "Scans the selected universe and returns every ticker with a bullish MA crossover "
-        "signal combined with positive 1-month momentum. Fibonacci zones shown in results."
+        "Scans the selected universe for bullish MA crossover + positive 1-month momentum. "
+        "Fibonacci zones and insider filter available."
     )
 
     tab_stocks, tab_crypto = st.tabs(["📈  Stocks", "₿  Crypto"])
 
-    # ── Stocks ────────────────────────────────────────────────────
     with tab_stocks:
-        col_uni, col_btn = st.columns([3, 1])
+        col_uni, col_ins, col_btn = st.columns([3, 2, 1])
         with col_uni:
             universe = st.selectbox(
-                "Select Market Universe",
+                "Market Universe",
                 [
                     "S&P 500  (~500 stocks, ~2–4 min)",
                     "Russell 2000  (~2,000 stocks, ~10–20 min)",
                     "All US Equities  (~1,500–3,000 stocks, ~15–30 min)",
-                ],
+                ]
+            )
+        with col_ins:
+            st.markdown("<br>", unsafe_allow_html=True)
+            insider_filter = st.checkbox(
+                "🔍 Filter: Insider cluster buys only",
+                help=(
+                    "Pre-filters to stocks where 3+ insiders bought recently "
+                    "(sourced from OpenInsider.com). Dramatically reduces scan size "
+                    "and surfaces the highest-conviction setups."
+                )
             )
         with col_btn:
             st.markdown("<br>", unsafe_allow_html=True)
             scan_btn = st.button("🚀  Launch Scan", use_container_width=True)
 
         if "Russell" in universe:
-            st.warning("⚠️ Large scan — expect 10–20 minutes. Best run during off-hours.")
+            st.warning("⚠️ Large scan — expect 10–20 min.")
         elif "All US" in universe:
-            st.warning("⚠️ Very large scan — expect 15–30 minutes.")
+            st.warning("⚠️ Very large scan — expect 15–30 min.")
         else:
-            st.info("ℹ️ ~500 stocks. Expected time: 2–4 minutes.")
+            st.info("ℹ️ ~500 stocks · Expected: 2–4 minutes.")
 
         if scan_btn:
             with st.spinner("Loading ticker universe…"):
@@ -1085,41 +1226,62 @@ elif mode == "🌐  Market Scanner":
                     tickers = get_all_us_equities()
 
             if not tickers:
-                st.error("Failed to load tickers. Check your internet connection.")
+                st.error("Failed to load ticker list. Check internet connection.")
             else:
-                st.info(f"Loaded **{len(tickers)}** tickers. Starting scan…")
-                results, figs = scan_tickers(tickers, sma_period, ma_type)
-
-                if results:
-                    st.success(f"✅ Scan complete — **{len(results)}** buy signals found")
-                    st.dataframe(
-                        pd.DataFrame(results), use_container_width=True, hide_index=True
-                    )
-                    st.subheader("📊  Deep-Dive Chart")
-                    triggered = [r["Ticker"] for r in results]
-                    view_sym  = st.selectbox("Select a triggered stock", triggered)
-
-                    if view_sym in figs:
-                        fig, fib = figs[view_sym]
-                        st.plotly_chart(fig, use_container_width=True)
-                        stock_metrics = next(
-                            (r for r in results if r["Ticker"] == view_sym), {}
+                # Apply insider filter if requested
+                if insider_filter:
+                    with st.spinner("Loading OpenInsider cluster buy data…"):
+                        insider_tickers = get_openinsider_cluster_buys()
+                    if insider_tickers:
+                        before = len(tickers)
+                        tickers = [t for t in tickers if t in insider_tickers]
+                        st.info(
+                            f"Insider filter: reduced from {before} → "
+                            f"**{len(tickers)}** tickers with cluster buying activity"
                         )
-                        show_ai_report(
-                            f"scanner_{view_sym}", view_sym, stock_metrics,
-                            sma_period, ma_type, fib,
-                            button_label="🤖  AI Analysis for this stock"
+                    else:
+                        st.warning(
+                            "OpenInsider data unavailable — running full scan without filter."
                         )
+
+                if not tickers:
+                    st.warning("No tickers remain after insider filter. Try without the filter.")
                 else:
-                    st.warning(
-                        "No stocks meet the buy signal criteria for the chosen MA period. "
-                        "Try a different lookback window in the sidebar."
-                    )
+                    st.info(f"Scanning **{len(tickers)}** tickers…")
+                    results, figs = scan_tickers(tickers, sma_period, ma_type)
 
-    # ── Crypto ────────────────────────────────────────────────────
+                    if results:
+                        st.success(f"✅ **{len(results)}** buy signals found")
+                        st.dataframe(
+                            pd.DataFrame(results), use_container_width=True, hide_index=True
+                        )
+                        st.subheader("📊  Chart Deep-Dive")
+                        triggered = [r["Ticker"] for r in results]
+                        view_sym  = st.selectbox("Select a stock", triggered)
+
+                        if view_sym in figs:
+                            fig, fib = figs[view_sym]
+                            st.plotly_chart(fig, use_container_width=True)
+                            render_insider_section(view_sym)
+                            stock_metrics = next(
+                                (r for r in results if r["Ticker"] == view_sym), {}
+                            )
+                            ins_df  = get_insider_transactions(view_sym)
+                            context = insider_summary(ins_df)
+                            show_ai_report(
+                                f"scanner_{view_sym}", view_sym, stock_metrics,
+                                sma_period, ma_type, fib,
+                                extra_context=context,
+                                button_label="🤖  AI Analysis for this stock"
+                            )
+                    else:
+                        st.warning(
+                            "No stocks meet the criteria. Try a different MA period in the sidebar."
+                        )
+
     with tab_crypto:
         st.subheader("₿  Major Crypto Dashboard")
-        st.caption("Bitcoin · Ethereum · XRP · Solana — all shown regardless of signal direction")
+        st.caption("Bitcoin · Ethereum · XRP · Solana — all shown regardless of signal")
         crypto_btn = st.button("📡  Refresh Crypto Data")
 
         if crypto_btn or "crypto_data" not in st.session_state:
@@ -1136,9 +1298,7 @@ elif mode == "🌐  Market Scanner":
         crypto_rows, crypto_figs = st.session_state.get("crypto_data", ([], {}))
 
         if crypto_rows:
-            st.dataframe(
-                pd.DataFrame(crypto_rows), use_container_width=True, hide_index=True
-            )
+            st.dataframe(pd.DataFrame(crypto_rows), use_container_width=True, hide_index=True)
             chosen_crypto = st.selectbox(
                 "Select crypto for chart",
                 list(CRYPTO_TICKERS.values()),
@@ -1150,16 +1310,18 @@ elif mode == "🌐  Market Scanner":
                 fig, fib = crypto_figs[chosen_crypto]
                 st.plotly_chart(fig, use_container_width=True)
                 crypto_metrics = next(
-                    (r for r in crypto_rows if chosen_crypto in r["Asset"]), {}
+                    (r for r in crypto_rows if chosen_crypto in r.get("Asset", "")), {}
                 )
+                # FIX: use extra_context= keyword consistently
                 show_ai_report(
                     f"crypto_{chosen_crypto}", chosen_crypto, crypto_metrics,
                     sma_period, ma_type, fib,
                     extra_context=(
-                        "This is a cryptocurrency. Factor in 24/7 trading, higher volatility "
-                        "norms, and absence of traditional fundamental metrics like P/E ratios."
+                        "This is a cryptocurrency. Factor in 24/7 trading, "
+                        "higher volatility norms, and absence of traditional fundamentals "
+                        "like P/E ratios. No insider transaction data applies to crypto."
                     ),
                     button_label="🤖  Generate Crypto AI Analysis"
                 )
         else:
-            st.info("Click 'Refresh Crypto Data' above to load.")
+            st.info("Click 'Refresh Crypto Data' to load.")
