@@ -154,20 +154,39 @@ if mode_selection == "Portfolio Dashboard":
                         else: st.error("Transmission aborted.")
                     except: st.error("Cloud server unavailable.")
 
-    with st.sidebar.expander("🛠️ Position Editor"):
-        new_ticker = st.text_input("Ticker Symbol").upper().strip()
-        new_shares = st.number_input("Shares Owned", min_value=0.0, step=0.0001, format="%.4f")
-        new_cost = st.number_input("Average Purchase Cost ($)", min_value=0.0, step=0.01)
+    # Upgraded Position Editor Panel (Handles Changes/Updates and Deletions natively)
+    with st.sidebar.expander("🛠️ Position Editor / Modifier", expanded=True):
+        st.write("Add new positions or modify existing asset allocations here.")
         
-        if st.button("Update Position"):
-            if new_ticker and new_shares > 0:
-                st.session_state.user_portfolio[new_ticker] = {"shares": new_shares, "cost": new_cost}
-                st.success(f"Updated {new_ticker}.")
-                st.rerun()
-            elif new_ticker in st.session_state.user_portfolio and new_shares == 0:
-                del st.session_state.user_portfolio[new_ticker]
-                st.warning(f"Removed {new_ticker}.")
-                st.rerun()
+        # If user picks an existing asset from a dropdown, auto-populate details to make editing easy
+        existing_assets = [""] + list(st.session_state.user_portfolio.keys())
+        selected_edit_ticker = st.selectbox("Quick-Select Active Asset to Edit", options=existing_assets, index=0)
+        
+        default_shares = 0.0
+        default_cost = 0.0
+        ticker_input_val = ""
+        
+        if selected_edit_ticker:
+            ticker_input_val = selected_edit_ticker
+            default_shares = float(st.session_state.user_portfolio[selected_edit_ticker]["shares"])
+            default_cost = float(st.session_state.user_portfolio[selected_edit_ticker]["cost"])
+
+        edit_ticker = st.text_input("Ticker Symbol", value=ticker_input_val).upper().strip()
+        edit_shares = st.number_input("Shares Owned (Set to 0 to Delete)", min_value=0.0, step=0.0001, format="%.4f", value=default_shares)
+        edit_cost = st.number_input("Average Purchase Cost ($)", min_value=0.0, step=0.01, value=default_cost)
+        
+        if st.button("Apply Position Changes"):
+            if edit_ticker:
+                if edit_shares > 0:
+                    st.session_state.user_portfolio[edit_ticker] = {"shares": edit_shares, "cost": edit_cost}
+                    st.success(f"Successfully updated position records for {edit_ticker}!")
+                    st.rerun()
+                elif edit_ticker in st.session_state.user_portfolio and edit_shares == 0:
+                    del st.session_state.user_portfolio[edit_ticker]
+                    st.warning(f"Purged {edit_ticker} position from active session workspace.")
+                    st.rerun()
+                else:
+                    st.error("Shares must be greater than zero to create a new asset record.")
 
     if not st.session_state.user_portfolio:
         st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets or input your sync details.")
@@ -217,18 +236,27 @@ if mode_selection == "Portfolio Dashboard":
         kpi2.metric("Net Cost Basis", f"${total_cost_basis:,.2f}")
         kpi3.metric("Total Performance Return", f"${total_gain:,.2f}", f"{total_gain_pct:.2f}%")
         
-        # --- UPGRADED CLUTTER-FREE DONUT ENGINE ---
+        # --- UPGRADED CLUTTER-FREE DONUT ENGINE WITH HOVER ELABORATION ---
         if pie_values:
             df_pie = pd.DataFrame({"Asset": pie_labels, "Value": pie_values})
             df_pie = df_pie.sort_values(by="Value", ascending=False).reset_index(drop=True)
             df_pie["Percentage"] = (df_pie["Value"] / total_market_value) * 100
             
-            # Group micro investments under 2.5% into an 'Other' segment to prevent wedge fracturing
-            MIN_THRESHOLD = 2.5
+            # Group micro investments under 4.5% into an 'Other' segment to prevent wedge fracturing
+            MIN_THRESHOLD = 4.5
             core_holdings = df_pie[df_pie["Percentage"] >= MIN_THRESHOLD]
             micro_holdings = df_pie[df_pie["Percentage"] < MIN_THRESHOLD]
             
+            # Build explicit hover descriptions for all items
+            hover_templates = []
+            
             if not micro_holdings.empty:
+                # Compile a descriptive HTML list detailing exactly what is hidden inside the slice
+                micro_lines = []
+                for _, row in micro_holdings.iterrows():
+                    micro_lines.append(f"• {row['Asset']}: ${row['Value']:,.2f} ({row['Percentage']:.1f}%)")
+                detailed_micro_hover = "<br><b>Underlying Slices Breakdown:</b><br>" + "<br>".join(micro_lines)
+                
                 other_row = pd.DataFrame([{
                     "Asset": f"Other ({len(micro_holdings)} Small Positions)",
                     "Value": micro_holdings["Value"].sum(),
@@ -237,12 +265,20 @@ if mode_selection == "Portfolio Dashboard":
                 df_final_pie = pd.concat([core_holdings, other_row], ignore_index=True)
             else:
                 df_final_pie = df_pie
+                detailed_micro_hover = ""
 
-            # CRITICAL VISIBILITY RULE: Permanently display static labels ONLY if size is >= 5.0%
+            # Generate dynamic text strings: Only show labels permanently on layout if slice size is >= 5.0%
             df_final_pie["CleanStaticLabel"] = df_final_pie.apply(
                 lambda r: f"{r['Asset']}<br>{r['Percentage']:.1f}%" if r['Percentage'] >= 5.0 else "",
                 axis=1
             )
+
+            # Generate smart custom hover text mapping per row
+            for _, row in df_final_pie.iterrows():
+                if "Other" in row["Asset"]:
+                    hover_templates.append(f"<b>{row['Asset']}</b><br>Total Combined Value: ${row['Value']:,.2f}<br>Total Combined Weight: {row['Percentage']:.1f}%{detailed_micro_hover}<extra></extra>")
+                else:
+                    hover_templates.append(f"<b>Asset:</b> {row['Asset']}<br><b>Market Value:</b> ${row['Value']:,.2f}<br><b>Allocation Weight:</b> {row['Percentage']:.1f}%<extra></extra>")
 
             fintech_colors = [
                 "#1f77b4", "#00b4d8", "#0077b6", "#0096c7", "#03045e",
@@ -256,8 +292,9 @@ if mode_selection == "Portfolio Dashboard":
                 hole=0.45,
                 text=df_final_pie["CleanStaticLabel"],
                 textinfo="text",
-                textposition="inside", # Pulls text clean inside the core sectors
-                hoverinfo="label+value+percent",
+                textposition="inside", 
+                hovertext=hover_templates,
+                hoverinfo="text",
                 automargin=True,
                 marker=dict(
                     colors=fintech_colors[:len(df_final_pie)],
@@ -269,12 +306,12 @@ if mode_selection == "Portfolio Dashboard":
                 title=dict(
                     text="🎯 Real-Time Strategic Asset Allocation Weighting", 
                     x=0.5,
-                    y=0.97, # Elevates the title position
+                    y=0.97, 
                     font=dict(size=18, family="Helvetica Neue, Arial, sans-serif", color="#ffffff")
                 ),
-                height=700, # Substantially larger layout canvas to prevent compression
+                height=700, # Expanded frame width preventing clip anomalies
                 template="plotly_dark",
-                margin=dict(l=50, r=50, t=100, b=100), # Ample frame spacing
+                margin=dict(l=50, r=50, t=100, b=100), 
                 showlegend=True,
                 legend=dict(
                     orientation="h",
