@@ -22,12 +22,13 @@ if "user_portfolio" not in st.session_state:
 
 TICKER_POOL = ["PLSE", "BRCB", "CELH", "SOFI", "HOOD", "DKNG"]
 
+# RESTORED: Full interval mapping with analytical descriptions
 INTERVAL_MAPPING = {
-    10: {"history": "3mo"},
-    20: {"history": "6mo"},
-    50: {"history": "1y"},
-    100: {"history": "2y"},
-    200: {"history": "2y"}
+    10: {"history": "3mo", "description": "Short-term momentum & micro-trends"},
+    20: {"history": "6mo", "description": "Standard short-term trend-following boundary"},
+    50: {"history": "1y", "description": "Medium-term structural support / Institutional tracking"},
+    100: {"history": "2y", "description": "Macro cycle support and accumulation zone"},
+    200: {"history": "2y", "description": "Long-term macro baseline (The ultimate bull/bear line)"}
 }
 
 # ==========================================
@@ -49,7 +50,7 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
         if hist.empty or len(hist) < period_window:
             return False, {}, None, 0.0
         
-        # High-Precision Trend Calculations (Upgraded to handle micro-holdings)
+        # High-Precision Trend Calculations (5-figure support)
         if "Simple" in calculation_type:
             hist['MA_Line'] = hist['Close'].rolling(window=period_window).mean()
             ma_acronym = "SMA"
@@ -135,11 +136,9 @@ if mode_selection == "Portfolio Dashboard":
                     st.warning("Portfolio workspace is empty.")
                 else:
                     try:
-                        # Proper Bucket Initialization to prevent 400/404 errors 
                         init_url = f"https://kvdb.io/{SYSTEM_BUCKET}"
                         requests.post(init_url, data={'email': 'admin@wallstreetdash.com'}, timeout=5)
                         
-                        # Now push payload
                         url = f"https://kvdb.io/{SYSTEM_BUCKET}/{composite_key}"
                         res = requests.put(url, json=st.session_state.user_portfolio, timeout=7)
                         if res.status_code in [200, 201]: 
@@ -210,7 +209,6 @@ if mode_selection == "Portfolio Dashboard":
                 passed, metrics, fig, current_price = fetch_technical_data(ticker, sma_period, ma_type)
                 
                 if current_price > 0:
-                    # High precision float handling essential for micro crypto fractions
                     position_cost = float(details['shares']) * float(details['cost'])
                     position_value = float(details['shares']) * current_price
                     position_gain = position_value - position_cost
@@ -245,12 +243,11 @@ if mode_selection == "Portfolio Dashboard":
         kpi3.metric("Total Performance Return", f"${total_gain:,.2f}", f"{total_gain_pct:.2f}%")
         
         # 3. Intelligent Stratified Donut Chart Engine
-        if pie_values:
+        if pie_values and total_market_value > 0:
             df_pie = pd.DataFrame({"Asset": pie_labels, "Value": pie_values})
             df_pie = df_pie.sort_values(by="Value", ascending=False).reset_index(drop=True)
             df_pie["Percentage"] = (df_pie["Value"] / total_market_value) * 100
             
-            # Use Pandas slicing to segment the positions safely
             top_5_core = df_pie.iloc[0:5]
             next_5_mid = df_pie.iloc[5:10]
             remaining_micro = df_pie.iloc[10:]
@@ -258,7 +255,7 @@ if mode_selection == "Portfolio Dashboard":
             final_slices = []
             hover_templates = []
             
-            # A. Core Top 5 (Labeled and always visible)
+            # A. Core Top 5
             for _, row in top_5_core.iterrows():
                 final_slices.append({
                     "Asset": row["Asset"],
@@ -268,12 +265,10 @@ if mode_selection == "Portfolio Dashboard":
                 })
                 hover_templates.append(f"<b>Core Position:</b> {row['Asset']}<br><b>Market Value:</b> ${row['Value']:,.2f}<br><b>Allocation Weight:</b> {row['Percentage']:.1f}%<extra></extra>")
             
-            # B. Next 5 Mid-Tier (Binned with dynamic hover breakdown)
+            # B. Next 5 Mid-Tier
             if not next_5_mid.empty:
                 mid_val_sum = next_5_mid["Value"].sum()
                 mid_pct_sum = next_5_mid["Percentage"].sum()
-                
-                # Compile dynamic hover data listing contents of the Mid-Tier bin 
                 mid_lines = [f"• {r['Asset']}: ${r['Value']:,.2f} ({r['Percentage']:.1f}%)" for _, r in next_5_mid.iterrows()]
                 detailed_mid_hover = "<br><b>Group Holdings:</b><br>" + "<br>".join(mid_lines)
                 
@@ -285,12 +280,10 @@ if mode_selection == "Portfolio Dashboard":
                 })
                 hover_templates.append(f"<b>Next 5 Mid-Tier Holdings</b><br>Total Group Value: ${mid_val_sum:,.2f}<br>Total Group Weight: {mid_pct_sum:.1f}%{detailed_mid_hover}<extra></extra>")
                 
-            # C. Troubleshooting Bin (Any other remaining assets spill over here) 
+            # C. Troubleshooting Bin 
             if not remaining_micro.empty:
                 rem_val_sum = remaining_micro["Value"].sum()
                 rem_pct_sum = remaining_micro["Percentage"].sum()
-                
-                # Compile spillover breakdown hover list
                 rem_lines = [f"• {r['Asset']}: ${r['Value']:,.2f} ({r['Percentage']:.1f}%)" for _, r in remaining_micro.iterrows()]
                 detailed_rem_hover = "<br><b>Remaining Assets:</b><br>" + "<br>".join(rem_lines)
                 
@@ -298,7 +291,7 @@ if mode_selection == "Portfolio Dashboard":
                     "Asset": "Other Remaining Positions",
                     "Value": rem_val_sum,
                     "Percentage": rem_pct_sum,
-                    "StaticLabel": "" # Hidden static text prevents chart clumping
+                    "StaticLabel": "" 
                 })
                 hover_templates.append(f"<b>Other Tail End Assets</b><br>Combined Spillover Value: ${rem_val_sum:,.2f}<br>Combined Spillover Weight: {rem_pct_sum:.1f}%{detailed_rem_hover}<extra></extra>")
 
@@ -338,7 +331,6 @@ if mode_selection == "Portfolio Dashboard":
             df_summary,
             column_config={
                 "Asset": st.column_config.TextColumn("Asset", disabled=True),
-                # shares upgraded to support up to 5 decimal significant figures 
                 "Shares": st.column_config.NumberColumn("Shares owned", min_value=0.0, format="%.5f", step=0.00001),
                 "Avg Cost": st.column_config.NumberColumn("Avg Cost ($)", min_value=0.0, format="$%.5f", step=0.00001),
                 "Current Price": st.column_config.NumberColumn("Current Price", disabled=True, format="$%.5f"),
@@ -352,7 +344,6 @@ if mode_selection == "Portfolio Dashboard":
             key="portfolio_inline_editor"
         )
         
-        # Commit inline modifications back to session state on save 
         if st.button("💾 Save Table Modifications", type="primary"):
             has_changes = False
             for idx, row in edited_df.iterrows():
@@ -361,7 +352,6 @@ if mode_selection == "Portfolio Dashboard":
                 target_cost = float(row["Avg Cost"])
                 baseline = st.session_state.user_portfolio.get(clean_ticker, {"shares": 0.0, "cost": 0.0})
                 
-                # Check for significant numerical deviations using float tolerance
                 if abs(target_shares - float(baseline["shares"])) > 1e-7 or abs(target_cost - float(baseline["cost"])) > 1e-7:
                     has_changes = True
                     if target_shares == 0:
@@ -376,7 +366,7 @@ if mode_selection == "Portfolio Dashboard":
             else:
                 st.info("No modifications detected.")
 
-        # 5. NEW: Portfolio Technical Scanner (Screener for held assets)
+        # 5. Portfolio Technical Scanner 
         st.markdown("---")
         st.subheader("🔍 Scan My Portfolio (Momentum Screener)")
         st.write("Run the analytical engine specifically on your current holdings to identify active trend momentum.")
@@ -389,7 +379,6 @@ if mode_selection == "Portfolio Dashboard":
                 
                 for ticker in portfolio_tickers:
                     passed, metrics, fig, _ = fetch_technical_data(ticker, sma_period, ma_type)
-                    # "passed" evaluates if the 1-month momentum is positive
                     if passed and fig is not None:
                         triggered_portfolio_stocks.append({"Ticker": ticker, **metrics})
                         saved_portfolio_figs[ticker] = fig
@@ -412,7 +401,6 @@ if mode_selection == "Portfolio Dashboard":
                 st.error("⚠️ Gemini API Key required.")
             else:
                 with st.spinner("Executing structural asset-correlation matrix analysis..."):
-                    # Cast summary view back to formatted string representation for the AI context 
                     ai_export_df = edited_df.copy()
                     ai_export_df["Shares"] = ai_export_df["Shares"].map(lambda x: f"{x:.5f}")
                     ai_export_df["Market Value"] = ai_export_df["Market Value"].map(lambda x: f"${x:,.2f}")
@@ -444,16 +432,40 @@ if mode_selection == "Portfolio Dashboard":
                     except Exception as e:
                         st.error(f"AI Engine Error: {e}")
         
-        # 7. Single Asset Chart Drill-Down
+        # 7. Detailed Single Asset Chart Drill-Down
         st.markdown("---")
         st.subheader("🎯 Single Asset Chart Drill-Down")
         selected_chart_ticker = st.selectbox("Choose a holding select for historical indicators", options=list(st.session_state.user_portfolio.keys()))
         
         if selected_chart_ticker in saved_charts and saved_charts[selected_chart_ticker] is not None:
             st.plotly_chart(saved_charts[selected_chart_ticker], use_container_width=True)
+            
+            if st.button("Generate Single Ticker Analyst Report") and api_key:
+                with st.spinner("Compiling individual asset waves..."):
+                    matched_row = edited_df[edited_df["Asset"].str.startswith(selected_chart_ticker)].iloc[0].to_dict()
+                    
+                    analysis_prompt_template = """
+                    You are an institutional Wall Street wealth analyst managing an account portfolio. 
+                    Analyze the parameters for held asset {ticker}:
+                    Current Account Tracking Parameters: {metrics}
+                    Lookback Calculation Rules: {window}-Day {method} boundaries.
+
+                    Provide a response with the following exact components:
+                    1. A Markdown table named 'Quantitative Position Tear Sheet' mapping the held metrics, structural tracking requirements, and active trend status.
+                    2. An Elliott Wave Technical Framework detailing psychological support bands and presumed wave counts based on current price interaction with the dynamic {window}-day {method} horizon.
+                    3. A clear, actionable bolded final 'Portfolio Strategy Suggestion' matching the position's risk tier.
+                    """
+                    try:
+                        client = genai.Client(api_key=api_key)
+                        response = client.models.generate_content(
+                            model='gemini-2.5-flash',
+                            contents=analysis_prompt_template.format(ticker=selected_chart_ticker, metrics=matched_row, window=sma_period, method=ma_type)
+                        )
+                        st.markdown(response.text)
+                    except Exception as e: st.error(f"AI Error: {e}")
 
 # ==========================================
-# MODE 2: SINGLE TICKER TEAR SHEET
+# MODE 2: DETAILED SINGLE TICKER TEAR SHEET
 # ==========================================
 elif mode_selection == "Analyze Single Ticker":
     user_ticker = st.text_input("Enter Stock Ticker:").upper()
@@ -467,7 +479,7 @@ elif mode_selection == "Analyze Single Ticker":
                     client = genai.Client(api_key=api_key)
                     response = client.models.generate_content(
                         model='gemini-2.5-flash',
-                        contents=f"Institutional Analyst Assessment for {user_ticker}. Financial Profile: {metrics}. Apply {sma_period}-day {ma_type} overlay. Generate Quantitative Screen Tear Sheet table, Elliott Wave psychological map, and final bolded Analyst Verdict."
+                        contents=f"Institutional Analyst Assessment for {user_ticker}. Financial Data Profile: {metrics}. Apply a {sma_period}-day {ma_type} overlay framework. Generate a Quantitative Screen Tear Sheet table, core real-world metric analogies, an Elliott Wave psychological map, and a final bolded Analyst Verdict."
                     )
                     st.markdown(response.text)
                 except Exception as e: st.error(f"Error: {e}")
