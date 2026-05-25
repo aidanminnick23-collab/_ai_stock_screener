@@ -110,7 +110,7 @@ with col_ma:
 with col_per:
     sma_period = st.selectbox("📈 Lookback Duration", options=list(INTERVAL_MAPPING.keys()), index=1, format_func=lambda x: f"{x}-Day Window")
 
-mode_selection = st.radio("Select Application Mode", ["Portfolio Dashboard", "Analyze Single Ticker", "Run Market Scanner"])
+mode_selection = st.radio("Select Application Mode", ["Portfolio Dashboard", "Analyze Single Ticker", "Run Global Market Scanner"])
 
 # ==========================================
 # MODE 1: PORTFOLIO DASHBOARD (MAIN VIEW)
@@ -135,7 +135,7 @@ if mode_selection == "Portfolio Dashboard":
                     st.warning("Portfolio workspace is empty.")
                 else:
                     try:
-                        # Proper Bucket Initialization to prevent 400/404 errors
+                        # Proper Bucket Initialization to prevent 400/404 errors 
                         init_url = f"https://kvdb.io/{SYSTEM_BUCKET}"
                         requests.post(init_url, data={'email': 'admin@wallstreetdash.com'}, timeout=5)
                         
@@ -273,7 +273,7 @@ if mode_selection == "Portfolio Dashboard":
                 mid_val_sum = next_5_mid["Value"].sum()
                 mid_pct_sum = next_5_mid["Percentage"].sum()
                 
-                # Compile dynamic hover data listing contents of the Mid-Tier bin
+                # Compile dynamic hover data listing contents of the Mid-Tier bin 
                 mid_lines = [f"• {r['Asset']}: ${r['Value']:,.2f} ({r['Percentage']:.1f}%)" for _, r in next_5_mid.iterrows()]
                 detailed_mid_hover = "<br><b>Group Holdings:</b><br>" + "<br>".join(mid_lines)
                 
@@ -285,7 +285,7 @@ if mode_selection == "Portfolio Dashboard":
                 })
                 hover_templates.append(f"<b>Next 5 Mid-Tier Holdings</b><br>Total Group Value: ${mid_val_sum:,.2f}<br>Total Group Weight: {mid_pct_sum:.1f}%{detailed_mid_hover}<extra></extra>")
                 
-            # C. Troubleshooting Bin (Any other remaining assets spill over here)
+            # C. Troubleshooting Bin (Any other remaining assets spill over here) 
             if not remaining_micro.empty:
                 rem_val_sum = remaining_micro["Value"].sum()
                 rem_pct_sum = remaining_micro["Percentage"].sum()
@@ -338,7 +338,7 @@ if mode_selection == "Portfolio Dashboard":
             df_summary,
             column_config={
                 "Asset": st.column_config.TextColumn("Asset", disabled=True),
-                # shares upgraded to support up to 5 decimal significant figures
+                # shares upgraded to support up to 5 decimal significant figures 
                 "Shares": st.column_config.NumberColumn("Shares owned", min_value=0.0, format="%.5f", step=0.00001),
                 "Avg Cost": st.column_config.NumberColumn("Avg Cost ($)", min_value=0.0, format="$%.5f", step=0.00001),
                 "Current Price": st.column_config.NumberColumn("Current Price", disabled=True, format="$%.5f"),
@@ -352,7 +352,7 @@ if mode_selection == "Portfolio Dashboard":
             key="portfolio_inline_editor"
         )
         
-        # Commit inline modifications back to session state on save
+        # Commit inline modifications back to session state on save 
         if st.button("💾 Save Table Modifications", type="primary"):
             has_changes = False
             for idx, row in edited_df.iterrows():
@@ -376,7 +376,33 @@ if mode_selection == "Portfolio Dashboard":
             else:
                 st.info("No modifications detected.")
 
-        # 5. Holistic AI Reporting Engine
+        # 5. NEW: Portfolio Technical Scanner (Screener for held assets)
+        st.markdown("---")
+        st.subheader("🔍 Scan My Portfolio (Momentum Screener)")
+        st.write("Run the analytical engine specifically on your current holdings to identify active trend momentum.")
+        
+        if st.button("Run Portfolio Technical Scan"):
+            portfolio_tickers = list(st.session_state.user_portfolio.keys())
+            with st.spinner(f"Running technical screen against {len(portfolio_tickers)} assets..."):
+                triggered_portfolio_stocks = []
+                saved_portfolio_figs = {}
+                
+                for ticker in portfolio_tickers:
+                    passed, metrics, fig, _ = fetch_technical_data(ticker, sma_period, ma_type)
+                    # "passed" evaluates if the 1-month momentum is positive
+                    if passed and fig is not None:
+                        triggered_portfolio_stocks.append({"Ticker": ticker, **metrics})
+                        saved_portfolio_figs[ticker] = fig
+                
+                if triggered_portfolio_stocks:
+                    st.success("Scanning complete! The following holdings show positive momentum triggers:")
+                    st.dataframe(pd.DataFrame(triggered_portfolio_stocks), use_container_width=True)
+                    top_port_stock = triggered_portfolio_stocks[0]["Ticker"]
+                    st.plotly_chart(saved_portfolio_figs[top_port_stock], use_container_width=True)
+                else:
+                    st.warning("None of your current holdings trigger the active momentum thresholds based on your lookback window.")
+
+        # 6. Holistic AI Reporting Engine
         st.markdown("---")
         st.subheader("🧠 Holistic Wealth & Diversification Audit")
         st.write("Passes your entire portfolio to Gemini to run cross-asset correlation checks and risk reviews.")
@@ -386,7 +412,7 @@ if mode_selection == "Portfolio Dashboard":
                 st.error("⚠️ Gemini API Key required.")
             else:
                 with st.spinner("Executing structural asset-correlation matrix analysis..."):
-                    # Cast summary view back to formatted string representation for the AI context
+                    # Cast summary view back to formatted string representation for the AI context 
                     ai_export_df = edited_df.copy()
                     ai_export_df["Shares"] = ai_export_df["Shares"].map(lambda x: f"{x:.5f}")
                     ai_export_df["Market Value"] = ai_export_df["Market Value"].map(lambda x: f"${x:,.2f}")
@@ -418,7 +444,7 @@ if mode_selection == "Portfolio Dashboard":
                     except Exception as e:
                         st.error(f"AI Engine Error: {e}")
         
-        # 6. Single Asset Chart Drill-Down
+        # 7. Single Asset Chart Drill-Down
         st.markdown("---")
         st.subheader("🎯 Single Asset Chart Drill-Down")
         selected_chart_ticker = st.selectbox("Choose a holding select for historical indicators", options=list(st.session_state.user_portfolio.keys()))
@@ -447,10 +473,13 @@ elif mode_selection == "Analyze Single Ticker":
                 except Exception as e: st.error(f"Error: {e}")
 
 # ==========================================
-# MODE 3: MARKET SCANNER
+# MODE 3: GLOBAL MARKET SCANNER
 # ==========================================
-elif mode_selection == "Run Market Scanner":
-    if st.button("Launch Scan Now"):
+elif mode_selection == "Run Global Market Scanner":
+    st.header("🌍 Global Market Scanner")
+    st.write(f"Running analytical momentum screens against predefined pool: {', '.join(TICKER_POOL)}")
+    
+    if st.button("Launch Global Scan Now"):
         if not api_key: st.error("⚠️ Gemini API Key required.")
         else:
             triggered_stocks = []
@@ -461,8 +490,8 @@ elif mode_selection == "Run Market Scanner":
                     triggered_stocks.append({"Ticker": ticker, **metrics})
                     saved_figs[ticker] = fig
             if triggered_stocks:
-                st.success("Scanning complete!")
+                st.success("Scanning complete! The following globally monitored assets show positive momentum:")
                 st.dataframe(pd.DataFrame(triggered_stocks), use_container_width=True)
                 st.plotly_chart(saved_figs[triggered_stocks[0]["Ticker"]], use_container_width=True)
             else:
-                st.warning("No assets currently trigger momentum thresholds.")
+                st.warning("No assets in the global pool currently trigger momentum thresholds.")
