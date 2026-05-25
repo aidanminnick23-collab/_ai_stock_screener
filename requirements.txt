@@ -1,5 +1,7 @@
 streamlit
 yfinance
 pandas
+numpy
 google-genai
 plotly
+requests
