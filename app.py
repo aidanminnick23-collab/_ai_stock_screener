@@ -105,9 +105,292 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
     except:
         return False, {}, None, 0.0
 
-mode = st.radio("Select Application Mode", ["💼 My Portfolio Dashboard", "Analyze Single Ticker", "Run Market Scanner"])
+# Fixed option layout using safe strings rather than inline raw emojis to pass control switches securely
+mode_selection = st.radio("Select Application Mode", ["Portfolio Dashboard", "Analyze Single Ticker", "Run Market Scanner"])
 
 # ----------------------------------------------------
 # MODE 1: THE USER PORTFOLIO DASHBOARD (INTEGRATED VIEW)
 # ----------------------------------------------------
-if mode == "💼
+if mode_selection == "Portfolio Dashboard":
+    st.header("💼 Personal Holding Monitor")
+    
+    # Dual-Parameter Sync Engine Panel
+    with st.sidebar.expander("🌐 Cloud Vault Sync (Auto-Save)", expanded=True):
+        st.write("Save or retrieve your portfolio automatically from any device.")
+        vault_user = st.text_input("Vault Username/ID", value="amin")
+        user_pin = st.text_input("Secret Security PIN", max_chars=4, type="password")
+        col_load, col_save = st.columns(2)
+        SYSTEM_BUCKET = "wallstreet_ai_wealth_dash_v4"
+        
+        composite_key = f"{vault_user.strip()}_{user_pin.strip()}" if vault_user and user_pin else ""
+        
+        with col_save:
+            if st.button("💾 Cloud Save"):
+                if not vault_user or not user_pin or len(user_pin) != 4 or not user_pin.isdigit():
+                    st.error("Please enter a valid username and 4-digit numeric PIN.")
+                elif not st.session_state.user_portfolio:
+                    st.warning("Portfolio workspace is empty.")
+                else:
+                    try:
+                        url = f"https://kvdb.io/{SYSTEM_BUCKET}/{composite_key}"
+                        res = requests.put(url, json=st.session_state.user_portfolio, timeout=7)
+                        if res.status_code in [200, 201]: st.success("Portfolio backed up!")
+                        else: st.error("Sync registration failed.")
+                    except: st.error("Cloud server unavailable.")
+                        
+        with col_load:
+            if st.button("🔄 Load Portfolio"):
+                if not vault_user or not user_pin or len(user_pin) != 4 or not user_pin.isdigit():
+                    st.error("Please enter a username and 4-digit PIN.")
+                else:
+                    try:
+                        url = f"https://kvdb.io/{SYSTEM_BUCKET}/{composite_key}"
+                        res = requests.get(url, timeout=7)
+                        if res.status_code == 200:
+                            st.session_state.user_portfolio = res.json()
+                            st.success("Records loaded!")
+                            st.rerun()
+                        elif res.status_code == 404: st.error("Vault records not found.")
+                        else: st.error("Transmission aborted.")
+                    except: st.error("Cloud server unavailable.")
+
+    with st.sidebar.expander("🛠️ Position Editor"):
+        new_ticker = st.text_input("Ticker Symbol").upper().strip()
+        new_shares = st.number_input("Shares Owned", min_value=0.0, step=0.0001, format="%.4f")
+        new_cost = st.number_input("Average Purchase Cost ($)", min_value=0.0, step=0.01)
+        
+        if st.button("Update Position"):
+            if new_ticker and new_shares > 0:
+                st.session_state.user_portfolio[new_ticker] = {"shares": new_shares, "cost": new_cost}
+                st.success(f"Updated {new_ticker}.")
+                st.rerun()
+            elif new_ticker in st.session_state.user_portfolio and new_shares == 0:
+                del st.session_state.user_portfolio[new_ticker]
+                st.warning(f"Removed {new_ticker}.")
+                st.rerun()
+
+    if not st.session_state.user_portfolio:
+        st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets or input your sync details.")
+    else:
+        total_market_value = 0.0
+        total_cost_basis = 0.0
+        display_data = []
+        pie_labels = []
+        pie_values = []
+        saved_charts = {}
+        
+        with st.spinner("Streaming live quotes and matching dynamic trendlines..."):
+            for ticker, details in list(st.session_state.user_portfolio.items()):
+                passed, metrics, fig, current_price = fetch_technical_data(ticker, sma_period, ma_type)
+                
+                if current_price > 0:
+                    position_cost = details['shares'] * details['cost']
+                    position_value = details['shares'] * current_price
+                    position_gain = position_value - position_cost
+                    position_gain_pct = (position_gain / position_cost * 100) if position_cost > 0 else 0.0
+                    
+                    total_market_value += position_value
+                    total_cost_basis += position_cost
+                    saved_charts[ticker] = fig
+                    
+                    display_name = f"{ticker}-USD" if ticker in ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE"] else ticker
+                    pie_labels.append(display_name)
+                    pie_values.append(position_value)
+                    
+                    display_data.append({
+                        "Asset": display_name,
+                        "Shares": f"{details['shares']:.4f}" if details['shares'] % 1 != 0 else f"{details['shares']:.1f}",
+                        "Avg Cost": f"${details['cost']:.2f}",
+                        "Current Price": f"${current_price:.2f}",
+                        "Market Value": f"${position_value:.2f}",
+                        "Return ($)": f"${position_gain:.2f}",
+                        "Return (%)": f"{position_gain_pct:.1f}%",
+                        "Trend Signal": metrics.get("Current State", "Calculating")
+                    })
+
+        total_gain = total_market_value - total_cost_basis
+        total_gain_pct = (total_gain / total_cost_basis * 100) if total_cost_basis > 0 else 0.0
+        
+        # Performance KPIs Ribbon Banner
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("Total Asset Value", f"${total_market_value:,.2f}")
+        kpi2.metric("Net Cost Basis", f"${total_cost_basis:,.2f}")
+        kpi3.metric("Total Performance Return", f"${total_gain:,.2f}", f"{total_gain_pct:.2f}%")
+        
+        # --- UPGRADED CLUTTER-FREE DONUT ENGINE ---
+        if pie_values:
+            df_pie = pd.DataFrame({"Asset": pie_labels, "Value": pie_values})
+            df_pie = df_pie.sort_values(by="Value", ascending=False).reset_index(drop=True)
+            df_pie["Percentage"] = (df_pie["Value"] / total_market_value) * 100
+            
+            # Group micro investments under 2.5% into an 'Other' segment to prevent wedge fracturing
+            MIN_THRESHOLD = 2.5
+            core_holdings = df_pie[df_pie["Percentage"] >= MIN_THRESHOLD]
+            micro_holdings = df_pie[df_pie["Percentage"] < MIN_THRESHOLD]
+            
+            if not micro_holdings.empty:
+                other_row = pd.DataFrame([{
+                    "Asset": f"Other ({len(micro_holdings)} Small Positions)",
+                    "Value": micro_holdings["Value"].sum(),
+                    "Percentage": micro_holdings["Percentage"].sum()
+                }])
+                df_final_pie = pd.concat([core_holdings, other_row], ignore_index=True)
+            else:
+                df_final_pie = df_pie
+
+            # CRITICAL VISIBILITY RULE: Permanently display static labels ONLY if size is >= 5.0%
+            df_final_pie["CleanStaticLabel"] = df_final_pie.apply(
+                lambda r: f"{r['Asset']}<br>{r['Percentage']:.1f}%" if r['Percentage'] >= 5.0 else "",
+                axis=1
+            )
+
+            fintech_colors = [
+                "#1f77b4", "#00b4d8", "#0077b6", "#0096c7", "#03045e",
+                "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#457b9d",
+                "#a8dadc", "#1d3557", "#48cae4", "#b5e2fa", "#4a4e69"
+            ]
+            
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=df_final_pie["Asset"], 
+                values=df_final_pie["Value"], 
+                hole=0.45,
+                text=df_final_pie["CleanStaticLabel"],
+                textinfo="text",
+                textposition="inside", # Pulls text clean inside the core sectors
+                hoverinfo="label+value+percent",
+                automargin=True,
+                marker=dict(
+                    colors=fintech_colors[:len(df_final_pie)],
+                    line=dict(color='#111111', width=2)
+                )
+            )])
+            
+            fig_pie.update_layout(
+                title=dict(
+                    text="🎯 Real-Time Strategic Asset Allocation Weighting", 
+                    x=0.5,
+                    y=0.97, # Elevates the title position
+                    font=dict(size=18, family="Helvetica Neue, Arial, sans-serif", color="#ffffff")
+                ),
+                height=700, # Substantially larger layout canvas to prevent compression
+                template="plotly_dark",
+                margin=dict(l=50, r=50, t=100, b=100), # Ample frame spacing
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="top",
+                    y=-0.05,
+                    xanchor="center",
+                    x=0.5,
+                    font=dict(size=11, color="#cccccc")
+                )
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.subheader("Your Monitored Assets Summary")
+        st.dataframe(pd.DataFrame(display_data), use_container_width=True)
+        
+        # Aggregate Full Portfolio AI Strategic Analysis Matrix
+        st.markdown("---")
+        st.subheader("🧠 Holistic Wealth & Diversification Audit")
+        st.write("Passes your entire portfolio to Gemini to run cross-asset correlation checks and risk reviews.")
+        
+        if st.button("Generate Full Portfolio AI Macro Report"):
+            if not api_key:
+                st.error("⚠️ Gemini API Key required to run aggregate AI evaluations.")
+            else:
+                with st.spinner("Executing structural asset-correlation matrix analysis..."):
+                    portfolio_analysis_prompt = f"""
+                    You are an elite Wall Street Managing Director and Chief Wealth Management Strategist. 
+                    Perform a high-level strategic review on this client investment portfolio matrix:
+                    Total Wealth Under Management: ${total_market_value:,.2f}
+                    Consolidated Cost Basis: ${total_cost_basis:,.2f}
+                    Net Unreleased Returns: ${total_gain:,.2f} ({total_gain_pct:.2f}%)
+                    
+                    Held Asset Layout:
+                    {json.dumps(display_data, indent=2)}
+                    
+                    Active Macro Tracking Rule: {sma_period}-Day lookback using {ma_type} parameters.
+
+                    Provide a response with the following exact components:
+                    1. A Markdown table named 'Portfolio Diversification Analysis' ranking assets by weight, concentration tier, and risk status.
+                    2. Macro Risk & Correlation Assessment auditing asset vulnerabilities.
+                    3. Actionable Rebalancing Recommendations detailing what to hold, skim, or accumulate.
+                    4. A final bolded 'Chief Investment Officer (CIO) Mandate'.
+                    """
+                    try:
+                        client = genai.Client(api_key=api_key)
+                        response = client.models.generate_content(model='gemini-2.5-flash', contents=portfolio_analysis_prompt)
+                        st.markdown(response.text)
+                    except Exception as e:
+                        st.error(f"Portfolio AI Engine Error: {e}")
+        
+        # Single Ticker Deep Dive Section
+        st.markdown("---")
+        st.subheader("🎯 Single Asset Chart Drill-Down")
+        selected_chart_ticker = st.selectbox("Choose a holding to pull up historical indicators", options=list(st.session_state.user_portfolio.keys()))
+        
+        if selected_chart_ticker in saved_charts and saved_charts[selected_chart_ticker] is not None:
+            st.plotly_chart(saved_charts[selected_chart_ticker], use_container_width=True)
+            
+            if st.button("Generate Single Ticker Analyst Report") and api_key:
+                with st.spinner("Compiling individual asset waves..."):
+                    holding_metrics = [x for x in display_data if x["Asset"].startswith(selected_chart_ticker)][0]
+                    
+                    analysis_prompt_template = """
+                    You are an institutional Wall Street wealth analyst. Analyze held asset {ticker}:
+                    Current Account Tracking Parameters: {metrics}
+                    Lookback Calculation Rules: {window}-Day {method} boundaries.
+
+                    Provide a response with the following components:
+                    1. 'Quantitative Position Tear Sheet' table.
+                    2. An Elliott Wave Technical Framework.
+                    3. A clear, actionable bolded final 'Portfolio Strategy Suggestion'.
+                    """
+                    try:
+                        client = genai.Client(api_key=api_key)
+                        response = client.models.generate_content(
+                            model='gemini-2.5-flash',
+                            contents=analysis_prompt_template.format(ticker=selected_chart_ticker, metrics=holding_metrics, window=sma_period, method=ma_type)
+                        )
+                        st.markdown(response.text)
+                    except Exception as e: st.error(f"AI Error: {e}")
+
+# ----------------------------------------------------
+# RETAINED OPERATIONAL MODES (PROMPT INTEGRITY MAINTAINED)
+# ----------------------------------------------------
+elif mode_selection == "Analyze Single Ticker":
+    user_ticker = st.text_input("Enter Stock Ticker:").upper()
+    if user_ticker and st.button("Generate Tear Sheet"):
+        if not api_key: st.error("⚠️ Gemini API Key required.")
+        else:
+            with st.spinner("Crunching data..."):
+                passed, metrics, fig, _ = fetch_technical_data(user_ticker, sma_period, ma_type)
+                if fig is not None: st.plotly_chart(fig, use_container_width=True)
+                try:
+                    client = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=f"Institutional Analyst Assessment for {user_ticker}. Financial Data Profile: {metrics}. Apply a {sma_period}-day {ma_type} overlay framework. Generate a Quantitative Screen Tear Sheet table, core real-world metric analogies, an Elliott Wave psychological map, and a final bolded Analyst Verdict."
+                    )
+                    st.markdown(response.text)
+                except Exception as e: st.error(f"Error: {e}")
+
+elif mode_selection == "Run Market Scanner":
+    if st.button("Launch Scan Now"):
+        if not api_key: st.error("⚠️ Gemini API Key required.")
+        else:
+            triggered_stocks = []
+            saved_figs = {}
+            for ticker in TICKER_POOL:
+                passed, metrics, fig, _ = fetch_technical_data(ticker, sma_period, ma_type)
+                if passed and fig is not None:
+                    triggered_stocks.append({"Ticker": ticker, **metrics})
+                    saved_figs[ticker] = fig
+            if triggered_stocks:
+                st.success("Scanning complete!")
+                st.dataframe(triggered_stocks)
+                top_stock = triggered_stocks[0]["Ticker"]
+                st.plotly_chart(saved_figs[top_stock], use_container_width=True)
+            else:
+                st.warning("No assets currently trigger momentum thresholds.")
