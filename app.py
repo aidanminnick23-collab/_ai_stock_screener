@@ -105,7 +105,6 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
     except:
         return False, {}, None, 0.0
 
-# Fixed option layout using safe strings rather than inline raw emojis to pass control switches securely
 mode_selection = st.radio("Select Application Mode", ["Portfolio Dashboard", "Analyze Single Ticker", "Run Market Scanner"])
 
 # ----------------------------------------------------
@@ -154,11 +153,9 @@ if mode_selection == "Portfolio Dashboard":
                         else: st.error("Transmission aborted.")
                     except: st.error("Cloud server unavailable.")
 
-    # Upgraded Position Editor Panel (Handles Changes/Updates and Deletions natively)
+    # Sidebar Position Editor
     with st.sidebar.expander("🛠️ Position Editor / Modifier", expanded=True):
         st.write("Add new positions or modify existing asset allocations here.")
-        
-        # If user picks an existing asset from a dropdown, auto-populate details to make editing easy
         existing_assets = [""] + list(st.session_state.user_portfolio.keys())
         selected_edit_ticker = st.selectbox("Quick-Select Active Asset to Edit", options=existing_assets, index=0)
         
@@ -218,12 +215,12 @@ if mode_selection == "Portfolio Dashboard":
                     
                     display_data.append({
                         "Asset": display_name,
-                        "Shares": f"{details['shares']:.4f}" if details['shares'] % 1 != 0 else f"{details['shares']:.1f}",
-                        "Avg Cost": f"${details['cost']:.2f}",
-                        "Current Price": f"${current_price:.2f}",
-                        "Market Value": f"${position_value:.2f}",
-                        "Return ($)": f"${position_gain:.2f}",
-                        "Return (%)": f"{position_gain_pct:.1f}%",
+                        "Shares": float(details['shares']),
+                        "Avg Cost": float(details['cost']),
+                        "Current Price": current_price,
+                        "Market Value": position_value,
+                        "Return ($)": position_gain,
+                        "Return (%)": position_gain_pct,
                         "Trend Signal": metrics.get("Current State", "Calculating")
                     })
 
@@ -236,61 +233,78 @@ if mode_selection == "Portfolio Dashboard":
         kpi2.metric("Net Cost Basis", f"${total_cost_basis:,.2f}")
         kpi3.metric("Total Performance Return", f"${total_gain:,.2f}", f"{total_gain_pct:.2f}%")
         
-        # --- UPGRADED CLUTTER-FREE DONUT ENGINE WITH HOVER ELABORATION ---
+        # --- UPGRADED TOP 5 CORE + NEXT 5 NESTED HOVER ENGINE ---
         if pie_values:
             df_pie = pd.DataFrame({"Asset": pie_labels, "Value": pie_values})
             df_pie = df_pie.sort_values(by="Value", ascending=False).reset_index(drop=True)
             df_pie["Percentage"] = (df_pie["Value"] / total_market_value) * 100
             
-            # Group micro investments under 4.5% into an 'Other' segment to prevent wedge fracturing
-            MIN_THRESHOLD = 4.5
-            core_holdings = df_pie[df_pie["Percentage"] >= MIN_THRESHOLD]
-            micro_holdings = df_pie[df_pie["Percentage"] < MIN_THRESHOLD]
+            # Segment the positions safely regardless of how high the count increases
+            top_5_core = df_pie.iloc[0:5]
+            next_5_mid = df_pie.iloc[5:10]
+            remaining_micro = df_pie.iloc[10:]
             
-            # Build explicit hover descriptions for all items
+            final_slices = []
             hover_templates = []
             
-            if not micro_holdings.empty:
-                # Compile a descriptive HTML list detailing exactly what is hidden inside the slice
-                micro_lines = []
-                for _, row in micro_holdings.iterrows():
-                    micro_lines.append(f"• {row['Asset']}: ${row['Value']:,.2f} ({row['Percentage']:.1f}%)")
-                detailed_micro_hover = "<br><b>Underlying Slices Breakdown:</b><br>" + "<br>".join(micro_lines)
+            # 1. Process top 5 core items (Always visible)
+            for _, row in top_5_core.iterrows():
+                final_slices.append({
+                    "Asset": row["Asset"],
+                    "Value": row["Value"],
+                    "Percentage": row["Percentage"],
+                    "StaticLabel": f"{row['Asset']}<br>{row['Percentage']:.1f}%"
+                })
+                hover_templates.append(f"<b>Core Position:</b> {row['Asset']}<br><b>Market Value:</b> ${row['Value']:,.2f}<br><b>Allocation Weight:</b> {row['Percentage']:.1f}%<extra></extra>")
+            
+            # 2. Process next 5 mid-tier positions (Binned into a single smart nested group)
+            if not next_5_mid.empty:
+                mid_val_sum = next_5_mid["Value"].sum()
+                mid_pct_sum = next_5_mid["Percentage"].sum()
                 
-                other_row = pd.DataFrame([{
-                    "Asset": f"Other ({len(micro_holdings)} Small Positions)",
-                    "Value": micro_holdings["Value"].sum(),
-                    "Percentage": micro_holdings["Percentage"].sum()
-                }])
-                df_final_pie = pd.concat([core_holdings, other_row], ignore_index=True)
-            else:
-                df_final_pie = df_pie
-                detailed_micro_hover = ""
+                mid_lines = []
+                for _, row in next_5_mid.iterrows():
+                    mid_lines.append(f"• {row['Asset']}: ${row['Value']:,.2f} ({row['Percentage']:.1f}%)")
+                detailed_mid_hover = "<br><b>Group Holdings:</b><br>" + "<br>".join(mid_lines)
+                
+                final_slices.append({
+                    "Asset": "Next 5 Mid-Tier Holdings",
+                    "Value": mid_val_sum,
+                    "Percentage": mid_pct_sum,
+                    "StaticLabel": f"Next 5 Slices<br>{mid_pct_sum:.1f}%"
+                })
+                hover_templates.append(f"<b>Next 5 Mid-Tier Holdings</b><br>Total Group Value: ${mid_val_sum:,.2f}<br>Total Group Weight: {mid_pct_sum:.1f}%{detailed_mid_hover}<extra></extra>")
+                
+            # 3. Troubleshooting Safeguard: Anything beyond the top 10 falls automatically here
+            if not remaining_micro.empty:
+                rem_val_sum = remaining_micro["Value"].sum()
+                rem_pct_sum = remaining_micro["Percentage"].sum()
+                
+                rem_lines = []
+                for _, row in remaining_micro.iterrows():
+                    rem_lines.append(f"• {row['Asset']}: ${row['Value']:,.2f} ({row['Percentage']:.1f}%)")
+                detailed_rem_hover = "<br><b>Remaining Assets:</b><br>" + "<br>".join(rem_lines)
+                
+                final_slices.append({
+                    "Asset": "Other Remaining Positions",
+                    "Value": rem_val_sum,
+                    "Percentage": rem_pct_sum,
+                    "StaticLabel": "" # Hidden to prevent compression text clutter
+                })
+                hover_templates.append(f"<b>Other Tail End Assets</b><br>Combined Spillover Value: ${rem_val_sum:,.2f}<br>Combined Spillover Weight: {rem_pct_sum:.1f}%{detailed_rem_hover}<extra></extra>")
 
-            # Generate dynamic text strings: Only show labels permanently on layout if slice size is >= 5.0%
-            df_final_pie["CleanStaticLabel"] = df_final_pie.apply(
-                lambda r: f"{r['Asset']}<br>{r['Percentage']:.1f}%" if r['Percentage'] >= 5.0 else "",
-                axis=1
-            )
-
-            # Generate smart custom hover text mapping per row
-            for _, row in df_final_pie.iterrows():
-                if "Other" in row["Asset"]:
-                    hover_templates.append(f"<b>{row['Asset']}</b><br>Total Combined Value: ${row['Value']:,.2f}<br>Total Combined Weight: {row['Percentage']:.1f}%{detailed_micro_hover}<extra></extra>")
-                else:
-                    hover_templates.append(f"<b>Asset:</b> {row['Asset']}<br><b>Market Value:</b> ${row['Value']:,.2f}<br><b>Allocation Weight:</b> {row['Percentage']:.1f}%<extra></extra>")
+            df_final_pie = pd.DataFrame(final_slices)
 
             fintech_colors = [
                 "#1f77b4", "#00b4d8", "#0077b6", "#0096c7", "#03045e",
-                "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#457b9d",
-                "#a8dadc", "#1d3557", "#48cae4", "#b5e2fa", "#4a4e69"
+                "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#457b9d"
             ]
             
             fig_pie = go.Figure(data=[go.Pie(
                 labels=df_final_pie["Asset"], 
                 values=df_final_pie["Value"], 
                 hole=0.45,
-                text=df_final_pie["CleanStaticLabel"],
+                text=df_final_pie["StaticLabel"],
                 textinfo="text",
                 textposition="inside", 
                 hovertext=hover_templates,
@@ -309,7 +323,7 @@ if mode_selection == "Portfolio Dashboard":
                     y=0.97, 
                     font=dict(size=18, family="Helvetica Neue, Arial, sans-serif", color="#ffffff")
                 ),
-                height=700, # Expanded frame width preventing clip anomalies
+                height=700, 
                 template="plotly_dark",
                 margin=dict(l=50, r=50, t=100, b=100), 
                 showlegend=True,
@@ -324,9 +338,60 @@ if mode_selection == "Portfolio Dashboard":
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
-        st.subheader("Your Monitored Assets Summary")
-        st.dataframe(pd.DataFrame(display_data), use_container_width=True)
+        # --- INTERACTIVE POSITION SUMMARY TABLE EDITOR ---
+        st.subheader("📋 Your Monitored Assets Summary")
+        st.write("💡 *Tip: Double-click any cell under 'Shares' or 'Avg Cost' to edit your holdings right inside the table row.*")
         
+        df_summary = pd.DataFrame(display_data)
+        
+        # Configure display format definitions cleanly for presentation layer
+        df_display = df_summary.copy()
+        
+        # We present unformatted floats to the data_editor so it can parse math entries cleanly
+        edited_df = st.data_editor(
+            df_display,
+            column_config={
+                "Asset": st.column_config.TextColumn("Asset", disabled=True),
+                "Shares": st.column_config.NumberColumn("Shares", min_value=0.0, format="%.4f", step=0.01),
+                "Avg Cost": st.column_config.NumberColumn("Avg Cost ($)", min_value=0.0, format="$%.2f", step=0.01),
+                "Current Price": st.column_config.NumberColumn("Current Price", disabled=True, format="$%.2f"),
+                "Market Value": st.column_config.NumberColumn("Market Value", disabled=True, format="$%.2f"),
+                "Return ($)": st.column_config.NumberColumn("Return ($)", disabled=True, format="$%.2f"),
+                "Return (%)": st.column_config.NumberColumn("Return (%)", disabled=True, format="%.1f%%"),
+                "Trend Signal": st.column_config.TextColumn("Trend Signal", disabled=True)
+            },
+            disabled=["Asset", "Current Price", "Market Value", "Return ($)", "Return (%)", "Trend Signal"],
+            use_container_width=True,
+            key="portfolio_inline_editor"
+        )
+        
+        # Detect inline revisions and commit changes
+        if st.button("💾 Save Table Modifications", type="primary"):
+            has_changes = False
+            for idx, row in edited_df.iterrows():
+                clean_ticker = row["Asset"].replace("-USD", "")
+                target_shares = float(row["Shares"])
+                target_cost = float(row["Avg Cost"])
+                
+                # Compare row values against baseline session data store
+                baseline = st.session_state.user_portfolio.get(clean_ticker, {"shares": 0, "cost": 0})
+                
+                if target_shares != float(baseline["shares"]) or target_cost != float(baseline["cost"]):
+                    has_changes = True
+                    if target_shares == 0:
+                        if clean_ticker in st.session_state.user_portfolio:
+                            del st.session_state.user_portfolio[clean_ticker]
+                    else:
+                        st.session_state.user_portfolio[clean_ticker] = {
+                            "shares": target_shares,
+                            "cost": target_cost
+                        }
+            if has_changes:
+                st.success("Modifications saved successfully!")
+                st.rerun()
+            else:
+                st.info("No modifications detected.")
+
         # Aggregate Full Portfolio AI Strategic Analysis Matrix
         st.markdown("---")
         st.subheader("🧠 Holistic Wealth & Diversification Audit")
@@ -337,6 +402,12 @@ if mode_selection == "Portfolio Dashboard":
                 st.error("⚠️ Gemini API Key required to run aggregate AI evaluations.")
             else:
                 with st.spinner("Executing structural asset-correlation matrix analysis..."):
+                    # Cast summary view back to string representation safely for transmission
+                    ai_export_df = edited_df.copy()
+                    ai_export_df["Market Value"] = ai_export_df["Market Value"].map(lambda x: f"${x:,.2f}")
+                    ai_export_df["Return ($)"] = ai_export_df["Return ($)"].map(lambda x: f"${x:,.2f}")
+                    ai_export_df["Return (%)"] = ai_export_df["Return (%)"].map(lambda x: f"{x:.1f}%")
+                    
                     portfolio_analysis_prompt = f"""
                     You are an elite Wall Street Managing Director and Chief Wealth Management Strategist. 
                     Perform a high-level strategic review on this client investment portfolio matrix:
@@ -345,7 +416,7 @@ if mode_selection == "Portfolio Dashboard":
                     Net Unreleased Returns: ${total_gain:,.2f} ({total_gain_pct:.2f}%)
                     
                     Held Asset Layout:
-                    {json.dumps(display_data, indent=2)}
+                    {ai_export_df.to_json(orient="records", indent=2)}
                     
                     Active Macro Tracking Rule: {sma_period}-Day lookback using {ma_type} parameters.
 
@@ -372,7 +443,8 @@ if mode_selection == "Portfolio Dashboard":
             
             if st.button("Generate Single Ticker Analyst Report") and api_key:
                 with st.spinner("Compiling individual asset waves..."):
-                    holding_metrics = [x for x in display_data if x["Asset"].startswith(selected_chart_ticker)][0]
+                    # Extract rows matching specific targeted key token safely 
+                    matched_row = edited_df[edited_df["Asset"].str.startswith(selected_chart_ticker)].iloc[0].to_dict()
                     
                     analysis_prompt_template = """
                     You are an institutional Wall Street wealth analyst. Analyze held asset {ticker}:
@@ -388,7 +460,7 @@ if mode_selection == "Portfolio Dashboard":
                         client = genai.Client(api_key=api_key)
                         response = client.models.generate_content(
                             model='gemini-2.5-flash',
-                            contents=analysis_prompt_template.format(ticker=selected_chart_ticker, metrics=holding_metrics, window=sma_period, method=ma_type)
+                            contents=analysis_prompt_template.format(ticker=selected_chart_ticker, metrics=matched_row, window=sma_period, method=ma_type)
                         )
                         st.markdown(response.text)
                     except Exception as e: st.error(f"AI Error: {e}")
