@@ -1,22 +1,17 @@
 import streamlit as st
 import yfinance as yf
-import google.generativeai as genai
+from google import genai  # Updated to modern 2026 SDK
 
 st.title("📊 Wall Street AI Scanner & Tear Sheet Tool")
 st.write("Scans tickers, applies a quantitative 'Buy Trigger', and generates AI insights.")
 
-# FIXED: Moved API Key input to the main screen so it's impossible to miss on mobile
+# API Key input on the main screen
 api_key = st.text_input("🔑 Enter Gemini API Key", type="password")
-if api_key:
-    genai.configure(api_key=api_key)
-else:
-    st.info("Please enter your Gemini API Key above to activate the AI generation.")
 
 # Predefined pool to scan
 TICKER_POOL = ["PLSE", "BRCB", "CELH", "SOFI", "HOOD", "DKNG"]
 
-# FIXED: Removed ticker.info entirely to prevent Streamlit Cloud from freezing.
-# We now calculate momentum metrics using historical price data, which safely bypasses blocks.
+# Quantitative momentum logic using historical price boundaries
 def check_quantitative_trigger(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -28,7 +23,6 @@ def check_quantitative_trigger(ticker_symbol):
         prior_price = hist['Close'].iloc[0]
         one_month_change = ((current_price - prior_price) / prior_price) * 100
         
-        # Simple Trigger: Flagging positive momentum over the last month
         if one_month_change > 0:
             return True, {
                 "Price": f"${current_price:.2f}",
@@ -63,8 +57,12 @@ if mode == "Analyze Single Ticker":
                     metrics = {"Price": "Data fetch restricted, relying on AI synthesis."}
                 
                 try:
-                    model = genai.GenerativeModel('gemini-1.5-pro')
-                    response = model.generate_content(analysis_prompt_template.format(ticker=user_ticker, metrics=metrics))
+                    # Updated client construction and modern gemini-2.5-pro model execution
+                    client = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model='gemini-2.5-pro',
+                        contents=analysis_prompt_template.format(ticker=user_ticker, metrics=metrics)
+                    )
                     st.markdown(response.text)
                 except Exception as e:
                     st.error(f"AI Error: {e}")
@@ -90,8 +88,15 @@ elif mode == "Run Market Scanner (Buy Trigger)":
                 st.subheader(f"Deep-Dive Analyst Report for Top Triggered Stock: {top_stock}")
                 
                 with st.spinner("Executing Wall Street evaluation..."):
-                    model = genai.GenerativeModel('gemini-1.5-pro')
-                    response = model.generate_content(analysis_prompt_template.format(ticker=top_stock, metrics=triggered_stocks[0]))
-                    st.markdown(response.text)
+                    try:
+                        # Updated client construction and modern gemini-2.5-pro model execution
+                        client = genai.Client(api_key=api_key)
+                        response = client.models.generate_content(
+                            model='gemini-2.5-pro',
+                            contents=analysis_prompt_template.format(ticker=top_stock, metrics=triggered_stocks[0])
+                        )
+                        st.markdown(response.text)
+                    except Exception as e:
+                        st.error(f"AI Error: {e}")
             else:
                 st.warning("No stocks currently meet the criteria.")
