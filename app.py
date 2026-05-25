@@ -41,7 +41,15 @@ with col_per:
 # Math Engine: Calculates SMA/WMA, signals, and builds interactive visuals
 def fetch_technical_data(ticker_symbol, period_window, calculation_type):
     try:
-        ticker = yf.Ticker(ticker_symbol)
+        clean_symbol = ticker_symbol.upper().strip()
+        
+        # --- SMART CRYPTO AUTO-CORRECTION PATCH ---
+        # If the user enters a standard crypto ticker, automatically format it for yFinance
+        COMMON_CRYPTOS = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "LINK", "DOT", "LTC"]
+        if clean_symbol in COMMON_CRYPTOS:
+            clean_symbol = f"{clean_symbol}-USD"
+            
+        ticker = yf.Ticker(clean_symbol)
         lookback = INTERVAL_MAPPING[period_window]["history"]
         hist = ticker.history(period=lookback)
         
@@ -93,7 +101,7 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
         fig.add_trace(go.Scatter(x=hist.index, y=hist['MA_Line'], name=ma_acronym, line=dict(color='#ff7f0e', width=1.5, dash='dot')))
         fig.add_trace(go.Scatter(x=hist.index, y=hist['Buy_Signal'], mode='markers', name='BUY', marker=dict(color='#2ca02c', size=10, symbol='triangle-up')))
         fig.add_trace(go.Scatter(x=hist.index, y=hist['Sell_Signal'], mode='markers', name='SELL', marker=dict(color='#d62728', size=10, symbol='triangle-down')))
-        fig.update_layout(title=f"{ticker_symbol} Technical View", xaxis_title="Date", yaxis_title="Price ($)", hovermode="x unified", template="plotly_dark", margin=dict(l=10,r=10,t=40,b=10))
+        fig.update_layout(title=f"{clean_symbol} Technical View", xaxis_title="Date", yaxis_title="Price ($)", hovermode="x unified", template="plotly_dark", margin=dict(l=10,r=10,t=40,b=10))
         
         return one_month_change > 0, metrics, fig, current_price
     except:
@@ -107,13 +115,11 @@ mode = st.radio("Select Application Mode", ["💼 My Portfolio Dashboard", "Anal
 if mode == "💼 My Portfolio Dashboard":
     st.header("Personal Holding Monitor")
     
-    # NEW: Secure Serverless Cloud Sync Engine Panel
     with st.sidebar.expander("🌐 Cloud Vault Sync (Auto-Save)", expanded=True):
         st.write("Save or retrieve your portfolio automatically from any device.")
-        vault_name = st.text_input("Vault Username/ID", help="Choose a unique name to identify your layout.")
-        vault_pin = st.text_input("Secret Security PIN", type="password", help="A private password to secure your file entry.")
+        vault_name = st.text_input("Vault Username/ID")
+        vault_pin = st.text_input("Secret Security PIN", type="password")
         
-        # Mathematical hash generator to establish completely private user isolation channels
         storage_key = ""
         if vault_name and vault_pin:
             combined_seed = f"wallstreet_v1_{vault_name.lower().strip()}_{vault_pin.strip()}"
@@ -127,16 +133,15 @@ if mode == "💼 My Portfolio Dashboard":
                     st.error("Enter Username & PIN")
                 else:
                     try:
-                        # Fetch payload from decentralized storage block securely
                         response = requests.get(f"https://api.keyvalue.xyz/{storage_key}/portfolio", timeout=5)
                         if response.status_code == 200 and response.text.strip():
                             st.session_state.user_portfolio = response.json()
                             st.success("Vault sync active!")
                             st.rerun()
                         else:
-                            st.warning("No saved record found for this combination.")
+                            st.warning("No saved record found.")
                     except:
-                        st.error("Cloud connection timed out. Try again.")
+                        st.error("Cloud connection timed out.")
                         
         with col_save:
             if st.button("💾 Cloud Save"):
@@ -146,7 +151,6 @@ if mode == "💼 My Portfolio Dashboard":
                     st.warning("Portfolio is empty.")
                 else:
                     try:
-                        # Post data directly into isolated user slot
                         response = requests.post(
                             f"https://api.keyvalue.xyz/{storage_key}/portfolio", 
                             json=st.session_state.user_portfolio, 
@@ -159,7 +163,6 @@ if mode == "💼 My Portfolio Dashboard":
                     except:
                         st.error("Cloud server unavailable.")
 
-    # Retained Sidebar Asset Editor
     with st.sidebar.expander("🛠️ Position Editor"):
         new_ticker = st.text_input("Ticker Symbol").upper().strip()
         new_shares = st.number_input("Shares Owned", min_value=0.0, step=1.0)
@@ -169,14 +172,12 @@ if mode == "💼 My Portfolio Dashboard":
             if new_ticker and new_shares > 0:
                 st.session_state.user_portfolio[new_ticker] = {"shares": new_shares, "cost": new_cost}
                 st.success(f"Updated {new_ticker} details.")
-                st.utility_marker = True 
             elif new_ticker in st.session_state.user_portfolio and new_shares == 0:
                 del st.session_state.user_portfolio[new_ticker]
                 st.warning(f"Removed {new_ticker}.")
 
-    # Processing Live Values across all unique holdings
     if not st.session_state.user_portfolio:
-        st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets or input your Cloud Vault credentials to restore your layout.")
+        st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets.")
     else:
         total_market_value = 0.0
         total_cost_basis = 0.0
@@ -199,7 +200,7 @@ if mode == "💼 My Portfolio Dashboard":
                     
                     display_data.append({
                         "Asset": ticker,
-                        "Shares": f"{details['shares']:.1f}",
+                        "Shares": f"{details['shares']:.2f}",
                         "Avg Cost": f"${details['cost']:.2f}",
                         "Current Price": f"${current_price:.2f}",
                         "Market Value": f"${position_value:.2f}",
