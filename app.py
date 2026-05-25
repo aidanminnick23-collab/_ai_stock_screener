@@ -113,42 +113,46 @@ mode = st.radio("Select Application Mode", ["💼 My Portfolio Dashboard", "Anal
 if mode == "💼 My Portfolio Dashboard":
     st.header("Personal Holding Monitor")
     
-    # Secure 4-Digit PIN Vault Routing Control Panel
-    with st.sidebar.expander("🌐 Cloud Vault Sync", expanded=True):
-        st.write("Sync your portfolio instantly using a personal 4-digit PIN.")
-        user_pin = st.text_input("Enter 4-Digit PIN", max_chars=4, type="password")
+    # Dual-Parameter Sync Engine Panel
+    with st.sidebar.expander("🌐 Cloud Vault Sync (Auto-Save)", expanded=True):
+        st.write("Save or retrieve your portfolio automatically from any device.")
+        vault_user = st.text_input("Vault Username/ID", value="amin")
+        user_pin = st.text_input("Secret Security PIN", max_chars=4, type="password")
         col_load, col_save = st.columns(2)
         SYSTEM_BUCKET = "wallstreet_ai_wealth_dash_v4"
         
+        # Unique combined data key routing path
+        composite_key = f"{vault_user.strip()}_{user_pin.strip()}" if vault_user and user_pin else ""
+        
         with col_save:
             if st.button("💾 Cloud Save"):
-                if not user_pin or len(user_pin) != 4 or not user_pin.isdigit():
-                    st.error("Please specify a valid 4-digit PIN.")
+                if not vault_user or not user_pin or len(user_pin) != 4 or not user_pin.isdigit():
+                    st.error("Please enter a valid username and 4-digit numeric PIN.")
                 elif not st.session_state.user_portfolio:
                     st.warning("Portfolio workspace is empty.")
                 else:
                     try:
-                        url = f"https://kvdb.io/{SYSTEM_BUCKET}/{user_pin.strip()}"
+                        url = f"https://kvdb.io/{SYSTEM_BUCKET}/{composite_key}"
                         res = requests.put(url, json=st.session_state.user_portfolio, timeout=7)
                         if res.status_code in [200, 201]: st.success("Portfolio backed up!")
                         else: st.error("Sync registration failed.")
-                    except: st.error("Cloud vault connection failed.")
+                    except: st.error("Cloud server unavailable.")
                         
         with col_load:
-            if st.button("🔄 Cloud Load"):
-                if not user_pin or len(user_pin) != 4 or not user_pin.isdigit():
-                    st.error("Please enter a 4-digit PIN.")
+            if st.button("🔄 Load Portfolio"):
+                if not vault_user or not user_pin or len(user_pin) != 4 or not user_pin.isdigit():
+                    st.error("Please enter a username and 4-digit PIN.")
                 else:
                     try:
-                        url = f"https://kvdb.io/{SYSTEM_BUCKET}/{user_pin.strip()}"
+                        url = f"https://kvdb.io/{SYSTEM_BUCKET}/{composite_key}"
                         res = requests.get(url, timeout=7)
                         if res.status_code == 200:
                             st.session_state.user_portfolio = res.json()
                             st.success("Records loaded!")
                             st.rerun()
-                        elif res.status_code == 404: st.error("PIN configuration not found.")
+                        elif res.status_code == 404: st.error("Vault records not found.")
                         else: st.error("Transmission aborted.")
-                    except: st.error("Cloud interface unreachable.")
+                    except: st.error("Cloud server unavailable.")
 
     with st.sidebar.expander("🛠️ Position Editor"):
         new_ticker = st.text_input("Ticker Symbol").upper().strip()
@@ -166,7 +170,7 @@ if mode == "💼 My Portfolio Dashboard":
                 st.rerun()
 
     if not st.session_state.user_portfolio:
-        st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets or input your 4-digit PIN.")
+        st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets or input your sync details.")
     else:
         total_market_value = 0.0
         total_cost_basis = 0.0
@@ -213,29 +217,74 @@ if mode == "💼 My Portfolio Dashboard":
         kpi2.metric("Net Cost Basis", f"${total_cost_basis:,.2f}")
         kpi3.metric("Total Performance Return", f"${total_gain:,.2f}", f"{total_gain_pct:.2f}%")
         
-        # NEW: Interactive Asset Allocation Pie Chart Render Block
+        # --- UPGRADED: ULTRA-CLEAN CLUTTER-FREE DONUT CHART ENGINE ---
         if pie_values:
+            df_pie = pd.DataFrame({"Asset": pie_labels, "Value": pie_values})
+            df_pie = df_pie.sort_values(by="Value", ascending=False).reset_index(drop=True)
+            
+            # Compute real portfolio weights
+            df_pie["Percentage"] = (df_pie["Value"] / total_market_value) * 100
+            
+            # Isolate core holdings vs tiny positions (< 2.5% allocation)
+            MIN_THRESHOLD = 2.5
+            core_holdings = df_pie[df_pie["Percentage"] >= MIN_THRESHOLD]
+            micro_holdings = df_pie[df_pie["Percentage"] < MIN_THRESHOLD]
+            
+            if not micro_holdings.empty:
+                other_row = pd.DataFrame([{
+                    "Asset": f"Other ({len(micro_holdings)} Small Positions)",
+                    "Value": micro_holdings["Value"].sum(),
+                    "Percentage": micro_holdings["Percentage"].sum()
+                }])
+                df_final_pie = pd.concat([core_holdings, other_row], ignore_index=True)
+            else:
+                df_final_pie = df_pie
+
+            # Sophisticated, High-Contrast FinTech Palette
+            fintech_colors = [
+                "#1f77b4", "#00b4d8", "#0077b6", "#0096c7", "#03045e",
+                "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#457b9d",
+                "#a8dadc", "#1d3557", "#48cae4", "#b5e2fa", "#4a4e69"
+            ]
+            
             fig_pie = go.Figure(data=[go.Pie(
-                labels=pie_labels, 
-                values=pie_values, 
-                hole=0.4,
+                labels=df_final_pie["Asset"], 
+                values=df_final_pie["Value"], 
+                hole=0.45,
                 hoverinfo="label+value+percent",
                 textinfo="percent+label",
-                textposition="inside",
-                marker=dict(line=dict(color='#111111', width=2))
+                textposition="outside",  # Pushes text clean of the pie borders
+                automargin=True,         # Ensures canvas shrinks to fit labels safely
+                marker=dict(
+                    colors=fintech_colors[:len(df_final_pie)],
+                    line=dict(color='#1e1e1e', width=2)
+                )
             )])
+            
             fig_pie.update_layout(
-                title=dict(text="🎯 Real-Time Strategic Asset Allocation Weighting", x=0.5),
+                title=dict(
+                    text="🎯 Real-Time Strategic Asset Allocation Weighting", 
+                    x=0.5,
+                    font=dict(size=16, family="Helvetica Neue, Arial, sans-serif", color="#ffffff")
+                ),
                 template="plotly_dark",
-                margin=dict(l=10, r=10, t=50, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5)
+                margin=dict(l=50, r=50, t=60, b=50),
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="top",
+                    y=-0.05,
+                    xanchor="center",
+                    x=0.5,
+                    font=dict(size=11, color="#cccccc")
+                )
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
         st.subheader("Your Monitored Assets Summary")
         st.dataframe(pd.DataFrame(display_data), use_container_width=True)
         
-        # NEW: Aggregate Full Portfolio AI Strategic Analysis Matrix
+        # Aggregate Full Portfolio AI Strategic Analysis Matrix
         st.markdown("---")
         st.subheader("🧠 Holistic Wealth & Diversification Audit")
         st.write("Passes your entire portfolio to Gemini to run cross-asset correlation checks and risk reviews.")
@@ -257,23 +306,20 @@ if mode == "💼 My Portfolio Dashboard":
                     
                     Active Macro Tracking Rule: {sma_period}-Day lookback using {ma_type} parameters.
 
-                    Provide a comprehensive executive advisory response with the following exact components:
-                    1. A Markdown table named 'Portfolio Diversification Analysis' ranking all assets by capitalization weight, concentration tier, and immediate technical risk status.
-                    2. Macro Risk & Correlation Assessment explicitly auditing underlying vulnerabilities (e.g., sector over-exposure, cash balance lags, or high crypto volatility concentration).
-                    3. Actionable Rebalancing Recommendations detailing exactly which assets to hold, skim, or accumulate based on active crossover triggers visible in the data data table.
-                    4. A final bolded 'Chief Investment Officer (CIO) Mandate' outlining immediate steps for wealth preservation and capital growth optimization.
+                    Provide a response with the following exact components:
+                    1. A Markdown table named 'Portfolio Diversification Analysis' ranking assets by weight, concentration tier, and risk status.
+                    2. Macro Risk & Correlation Assessment auditing asset vulnerabilities.
+                    3. Actionable Rebalancing Recommendations detailing what to hold, skim, or accumulate.
+                    4. A final bolded 'Chief Investment Officer (CIO) Mandate'.
                     """
                     try:
                         client = genai.Client(api_key=api_key)
-                        response = client.models.generate_content(
-                            model='gemini-2.5-flash',
-                            contents=portfolio_analysis_prompt
-                        )
+                        response = client.models.generate_content(model='gemini-2.5-flash', contents=portfolio_analysis_prompt)
                         st.markdown(response.text)
                     except Exception as e:
                         st.error(f"Portfolio AI Engine Error: {e}")
         
-        # Legacy/Individual Ticker Deep Dive Section
+        # Single Ticker Deep Dive Section
         st.markdown("---")
         st.subheader("🎯 Single Asset Chart Drill-Down")
         selected_chart_ticker = st.selectbox("Choose a holding to pull up historical indicators", options=list(st.session_state.user_portfolio.keys()))
@@ -286,14 +332,14 @@ if mode == "💼 My Portfolio Dashboard":
                     holding_metrics = [x for x in display_data if x["Asset"].startswith(selected_chart_ticker)][0]
                     
                     analysis_prompt_template = """
-                    You are an institutional Wall Street wealth analyst. Analyzeheld asset {ticker}:
+                    You are an institutional Wall Street wealth analyst. Analyze held asset {ticker}:
                     Current Account Tracking Parameters: {metrics}
                     Lookback Calculation Rules: {window}-Day {method} boundaries.
 
-                    Provide a response with the following exact components:
-                    1. A Markdown table named 'Quantitative Position Tear Sheet' mapping the held metrics, structural tracking requirements, and active trend status.
-                    2. An Elliott Wave Technical Framework detailing psychological support bands and presumed wave counts based on current price interaction with the dynamic {window}-day {method} horizon.
-                    3. A clear, actionable bolded final 'Portfolio Strategy Suggestion' matching the position's risk tier.
+                    Provide a response with the following components:
+                    1. 'Quantitative Position Tear Sheet' table.
+                    2. An Elliott Wave Technical Framework.
+                    3. A clear, actionable bolded final 'Portfolio Strategy Suggestion'.
                     """
                     try:
                         client = genai.Client(api_key=api_key)
@@ -302,8 +348,7 @@ if mode == "💼 My Portfolio Dashboard":
                             contents=analysis_prompt_template.format(ticker=selected_chart_ticker, metrics=holding_metrics, window=sma_period, method=ma_type)
                         )
                         st.markdown(response.text)
-                    except Exception as e:
-                        st.error(f"AI Error: {e}")
+                    except Exception as e: st.error(f"AI Error: {e}")
 
 # ----------------------------------------------------
 # RETAINED OPERATIONAL MODES (PROMPT INTEGRITY MAINTAINED)
