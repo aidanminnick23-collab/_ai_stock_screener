@@ -1,3 +1,4 @@
 streamlit
 yfinance
-google-generativeai
+pandas
+google-genai
