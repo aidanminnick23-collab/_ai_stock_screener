@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import json
-import hashlib
 import requests
 from google import genai  
 
@@ -44,7 +43,7 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
         clean_symbol = ticker_symbol.upper().strip()
         
         # --- SMART CRYPTO AUTO-CORRECTION PATCH ---
-        # If the user enters a standard crypto ticker, automatically format it for yFinance
+        # Automatically append -USD if a user types a popular crypto ticker natively
         COMMON_CRYPTOS = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "LINK", "DOT", "LTC"]
         if clean_symbol in COMMON_CRYPTOS:
             clean_symbol = f"{clean_symbol}-USD"
@@ -110,74 +109,87 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
 mode = st.radio("Select Application Mode", ["💼 My Portfolio Dashboard", "Analyze Single Ticker", "Run Market Scanner"])
 
 # ----------------------------------------------------
-# MODE 1: THE USER PORTFOLIO DASHBOARD (WITH CLOUD SYNC)
+# MODE 1: THE USER PORTFOLIO DASHBOARD (WITH UPGRADED SYNC)
 # ----------------------------------------------------
 if mode == "💼 My Portfolio Dashboard":
     st.header("Personal Holding Monitor")
     
-    with st.sidebar.expander("🌐 Cloud Vault Sync (Auto-Save)", expanded=True):
-        st.write("Save or retrieve your portfolio automatically from any device.")
-        vault_name = st.text_input("Vault Username/ID")
-        vault_pin = st.text_input("Secret Security PIN", type="password")
+    # UPGRADED: Stable JSONBlob Infrastructure Panel
+    with st.sidebar.expander("🌐 Cloud Vault Sync", expanded=True):
+        st.write("Sync your portfolio across any device via a stable cloud database.")
         
-        storage_key = ""
-        if vault_name and vault_pin:
-            combined_seed = f"wallstreet_v1_{vault_name.lower().strip()}_{vault_pin.strip()}"
-            storage_key = hashlib.sha256(combined_seed.encode()).hexdigest()[:16]
-            
+        vault_id = st.text_input("Cloud Vault ID", value=st.session_state.get("cloud_vault_id", ""))
+        
         col_load, col_save = st.columns(2)
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
         
-        with col_load:
-            if st.button("🔄 Load Portfolio"):
-                if not storage_key:
-                    st.error("Enter Username & PIN")
-                else:
-                    try:
-                        response = requests.get(f"https://api.keyvalue.xyz/{storage_key}/portfolio", timeout=5)
-                        if response.status_code == 200 and response.text.strip():
-                            st.session_state.user_portfolio = response.json()
-                            st.success("Vault sync active!")
-                            st.rerun()
-                        else:
-                            st.warning("No saved record found.")
-                    except:
-                        st.error("Cloud connection timed out.")
-                        
         with col_save:
             if st.button("💾 Cloud Save"):
-                if not storage_key:
-                    st.error("Enter Username & PIN")
-                elif not st.session_state.user_portfolio:
-                    st.warning("Portfolio is empty.")
+                if not st.session_state.user_portfolio:
+                    st.warning("Portfolio workspace is empty.")
                 else:
                     try:
-                        response = requests.post(
-                            f"https://api.keyvalue.xyz/{storage_key}/portfolio", 
-                            json=st.session_state.user_portfolio, 
-                            timeout=5
-                        )
-                        if response.status_code == 200:
-                            st.success("Saved to Cloud Vault!")
+                        if vault_id:
+                            # Safely update an existing container allocation
+                            url = f"https://jsonblob.com/api/jsonBlob/{vault_id.strip()}"
+                            res = requests.put(url, json=st.session_state.user_portfolio, headers=headers, timeout=7)
+                            if res.status_code == 200:
+                                st.success("Cloud Vault Updated!")
+                            else:
+                                st.error(f"Sync rewrite failed (Status {res.status_code})")
                         else:
-                            st.error("Vault saving failed.")
-                    except:
-                        st.error("Cloud server unavailable.")
+                            # Generate a brand-new storage key slot
+                            url = "https://jsonblob.com/api/jsonBlob"
+                            res = requests.post(url, json=st.session_state.user_portfolio, headers=headers, timeout=7)
+                            if res.status_code == 201:
+                                location_url = res.headers.get("Location", "")
+                                new_id = location_url.split("/")[-1] if location_url else ""
+                                if new_id:
+                                    st.session_state.cloud_vault_id = new_id
+                                    st.success("New Cloud Vault Initialized!")
+                                    st.code(new_id, language="text")
+                                    st.info("Copy this unique ID to sync your portfolio anywhere!")
+                                    st.rerun()
+                            else:
+                                st.error("Could not allocate a new cloud container slot.")
+                    except Exception as e:
+                        st.error(f"Network handshake failed: {e}")
+                        
+        with col_load:
+            if st.button("🔄 Cloud Load"):
+                if not vault_id:
+                    st.error("Enter an active Vault ID string to pull down records.")
+                else:
+                    try:
+                        url = f"https://jsonblob.com/api/jsonBlob/{vault_id.strip()}"
+                        res = requests.get(url, timeout=7)
+                        if res.status_code == 200:
+                            st.session_state.user_portfolio = res.json()
+                            st.session_state.cloud_vault_id = vault_id.strip()
+                            st.success("Portfolio successfully synced from cloud!")
+                            st.rerun()
+                        else:
+                            st.error(f"Vault target not found. Verify string. (Status {res.status_code})")
+                    except Exception as e:
+                        st.error(f"Cloud gateway unreachable: {e}")
 
     with st.sidebar.expander("🛠️ Position Editor"):
         new_ticker = st.text_input("Ticker Symbol").upper().strip()
-        new_shares = st.number_input("Shares Owned", min_value=0.0, step=1.0)
+        new_shares = st.number_input("Shares Owned", min_value=0.0, step=0.0001, format="%.4f")
         new_cost = st.number_input("Average Purchase Cost ($)", min_value=0.0, step=0.01)
         
         if st.button("Update Position"):
             if new_ticker and new_shares > 0:
                 st.session_state.user_portfolio[new_ticker] = {"shares": new_shares, "cost": new_cost}
                 st.success(f"Updated {new_ticker} details.")
+                st.rerun()
             elif new_ticker in st.session_state.user_portfolio and new_shares == 0:
                 del st.session_state.user_portfolio[new_ticker]
                 st.warning(f"Removed {new_ticker}.")
+                st.rerun()
 
     if not st.session_state.user_portfolio:
-        st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets.")
+        st.info("Your dashboard workspace is currently empty. Use the tools in the sidebar to add assets or input your Cloud Vault ID.")
     else:
         total_market_value = 0.0
         total_cost_basis = 0.0
@@ -198,9 +210,12 @@ if mode == "💼 My Portfolio Dashboard":
                     total_cost_basis += position_cost
                     saved_charts[ticker] = fig
                     
+                    # Determine display name dynamically for layout scannability
+                    display_name = f"{ticker}-USD (Crypto)" if ticker in ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE"] else ticker
+                    
                     display_data.append({
-                        "Asset": ticker,
-                        "Shares": f"{details['shares']:.2f}",
+                        "Asset": display_name,
+                        "Shares": f"{details['shares']:.4f}" if details['shares'] % 1 != 0 else f"{details['shares']:.1f}",
                         "Avg Cost": f"${details['cost']:.2f}",
                         "Current Price": f"${current_price:.2f}",
                         "Market Value": f"${position_value:.2f}",
@@ -228,7 +243,7 @@ if mode == "💼 My Portfolio Dashboard":
             
             if st.button("Generate AI Analyst Evaluation Report") and api_key:
                 with st.spinner("Compiling wave data structure analysis..."):
-                    holding_metrics = [x for x in display_data if x["Asset"] == selected_chart_ticker][0]
+                    holding_metrics = [x for x in display_data if x["Asset"].startswith(selected_chart_ticker)][0]
                     
                     analysis_prompt_template = """
                     You are an institutional Wall Street wealth analyst managing an account portfolio. 
