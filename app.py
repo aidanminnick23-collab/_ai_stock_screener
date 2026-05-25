@@ -1,7 +1,3 @@
-
-Conversation with Gemini
-Analyze this code to understand the program I am building. to troubleshoot this error message when trying to save a portfolio: import streamlit as st
-
 import yfinance as yf
 
 import pandas as pd
