@@ -37,7 +37,7 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
     try:
         clean_symbol = ticker_symbol.upper().strip()
         
-        # Smart Crypto Auto-Correction
+        # Smart Crypto Auto-Correction Patch
         COMMON_CRYPTOS = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "AVAX", "LINK", "DOT", "LTC"]
         if clean_symbol in COMMON_CRYPTOS:
             clean_symbol = f"{clean_symbol}-USD"
@@ -49,7 +49,7 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
         if hist.empty or len(hist) < period_window:
             return False, {}, None, 0.0
         
-        # High-Precision Trend Calculations
+        # High-Precision Trend Calculations (Upgraded to handle micro-holdings)
         if "Simple" in calculation_type:
             hist['MA_Line'] = hist['Close'].rolling(window=period_window).mean()
             ma_acronym = "SMA"
@@ -102,7 +102,7 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
         return False, {}, None, 0.0
 
 # ==========================================
-# GLOBAL APP ROUTING
+# APP ROUTING & UI LAYOUT
 # ==========================================
 col_ma, col_per = st.columns(2)
 with col_ma:
@@ -118,7 +118,7 @@ mode_selection = st.radio("Select Application Mode", ["Portfolio Dashboard", "An
 if mode_selection == "Portfolio Dashboard":
     st.header("💼 Personal Holding Monitor")
     
-    # 1. Ultra-Stable Cloud Sync Panel
+    # 1. Robust Cloud Sync Engine
     with st.sidebar.expander("🌐 Cloud Vault Sync", expanded=True):
         st.write("Sync your portfolio instantly using a secure connection.")
         vault_user = st.text_input("Vault Username/ID", value="amin")
@@ -135,10 +135,11 @@ if mode_selection == "Portfolio Dashboard":
                     st.warning("Portfolio workspace is empty.")
                 else:
                     try:
-                        # Pre-initialize bucket to prevent 400/404 registration errors
+                        # Proper Bucket Initialization to prevent 400/404 errors
                         init_url = f"https://kvdb.io/{SYSTEM_BUCKET}"
                         requests.post(init_url, data={'email': 'admin@wallstreetdash.com'}, timeout=5)
-                        # Push payload
+                        
+                        # Now push payload
                         url = f"https://kvdb.io/{SYSTEM_BUCKET}/{composite_key}"
                         res = requests.put(url, json=st.session_state.user_portfolio, timeout=7)
                         if res.status_code in [200, 201]: 
@@ -167,20 +168,23 @@ if mode_selection == "Portfolio Dashboard":
                     except Exception as e: 
                         st.error("Cloud interface unreachable.")
 
-    # 2. Sidebar Quick Position Editor (High Precision)
+    # 2. Sidebar Quick Position Editor (High Precision Handling)
     with st.sidebar.expander("🛠️ Add/Remove Position", expanded=True):
         existing_assets = [""] + list(st.session_state.user_portfolio.keys())
-        selected_edit_ticker = st.selectbox("Quick-Select Asset", options=existing_assets, index=0)
+        selected_edit_ticker = st.selectbox("Quick-Select Active Asset to Edit", options=existing_assets, index=0)
         
-        default_shares, default_cost = 0.0, 0.0
+        default_shares = 0.0
+        default_cost = 0.0
         ticker_input_val = selected_edit_ticker if selected_edit_ticker else ""
+        
         if selected_edit_ticker:
+            ticker_input_val = selected_edit_ticker
             default_shares = float(st.session_state.user_portfolio[selected_edit_ticker]["shares"])
             default_cost = float(st.session_state.user_portfolio[selected_edit_ticker]["cost"])
 
         edit_ticker = st.text_input("Ticker Symbol", value=ticker_input_val).upper().strip()
-        edit_shares = st.number_input("Shares Owned (0 to Delete)", min_value=0.0, step=0.00001, format="%.5f", value=default_shares)
-        edit_cost = st.number_input("Avg Cost ($)", min_value=0.0, step=0.00001, format="%.5f", value=default_cost)
+        edit_shares = st.number_input("Shares Owned (Set to 0 to Delete)", min_value=0.0, step=0.00001, format="%.5f", value=default_shares)
+        edit_cost = st.number_input("Average Purchase Cost ($)", min_value=0.0, step=0.00001, format="%.5f", value=default_cost)
         
         if st.button("Apply Quick Change"):
             if edit_ticker:
@@ -197,6 +201,8 @@ if mode_selection == "Portfolio Dashboard":
         total_market_value = 0.0
         total_cost_basis = 0.0
         display_data = []
+        pie_labels = []
+        pie_values = []
         saved_charts = {}
         
         with st.spinner("Streaming live quotes and matching dynamic trendlines..."):
@@ -204,6 +210,7 @@ if mode_selection == "Portfolio Dashboard":
                 passed, metrics, fig, current_price = fetch_technical_data(ticker, sma_period, ma_type)
                 
                 if current_price > 0:
+                    # High precision float handling essential for micro crypto fractions
                     position_cost = float(details['shares']) * float(details['cost'])
                     position_value = float(details['shares']) * current_price
                     position_gain = position_value - position_cost
@@ -214,6 +221,8 @@ if mode_selection == "Portfolio Dashboard":
                     saved_charts[ticker] = fig
                     
                     display_name = f"{ticker}-USD" if ticker in ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE"] else ticker
+                    pie_labels.append(display_name)
+                    pie_values.append(position_value)
                     
                     display_data.append({
                         "Asset": display_name,
@@ -229,40 +238,43 @@ if mode_selection == "Portfolio Dashboard":
         total_gain = total_market_value - total_cost_basis
         total_gain_pct = (total_gain / total_cost_basis * 100) if total_cost_basis > 0 else 0.0
         
-        # 3. KPI Ribbon
+        # Performance KPIs Ribbon Banner
         kpi1, kpi2, kpi3 = st.columns(3)
         kpi1.metric("Total Asset Value", f"${total_market_value:,.2f}")
         kpi2.metric("Net Cost Basis", f"${total_cost_basis:,.2f}")
         kpi3.metric("Total Performance Return", f"${total_gain:,.2f}", f"{total_gain_pct:.2f}%")
         
-        # 4. Advanced Binning Donut Chart Engine
-        df_pie_prep = pd.DataFrame(display_data)
-        if not df_pie_prep.empty:
-            df_pie_prep = df_pie_prep.sort_values(by="Market Value", ascending=False).reset_index(drop=True)
-            df_pie_prep["Percentage"] = (df_pie_prep["Market Value"] / total_market_value) * 100
+        # 3. Intelligent Stratified Donut Chart Engine
+        if pie_values:
+            df_pie = pd.DataFrame({"Asset": pie_labels, "Value": pie_values})
+            df_pie = df_pie.sort_values(by="Value", ascending=False).reset_index(drop=True)
+            df_pie["Percentage"] = (df_pie["Value"] / total_market_value) * 100
             
-            top_5_core = df_pie_prep.iloc[0:5]
-            next_5_mid = df_pie_prep.iloc[5:10]
-            remaining_micro = df_pie_prep.iloc[10:]
+            # Use Pandas slicing to segment the positions safely
+            top_5_core = df_pie.iloc[0:5]
+            next_5_mid = df_pie.iloc[5:10]
+            remaining_micro = df_pie.iloc[10:]
             
             final_slices = []
             hover_templates = []
             
-            # Core Top 5
+            # A. Core Top 5 (Labeled and always visible)
             for _, row in top_5_core.iterrows():
                 final_slices.append({
                     "Asset": row["Asset"],
-                    "Value": row["Market Value"],
+                    "Value": row["Value"],
                     "Percentage": row["Percentage"],
                     "StaticLabel": f"{row['Asset']}<br>{row['Percentage']:.1f}%"
                 })
-                hover_templates.append(f"<b>Core Position:</b> {row['Asset']}<br><b>Market Value:</b> ${row['Market Value']:,.2f}<br><b>Allocation Weight:</b> {row['Percentage']:.1f}%<extra></extra>")
+                hover_templates.append(f"<b>Core Position:</b> {row['Asset']}<br><b>Market Value:</b> ${row['Value']:,.2f}<br><b>Allocation Weight:</b> {row['Percentage']:.1f}%<extra></extra>")
             
-            # Next 5 Mid-Tier Bin
+            # B. Next 5 Mid-Tier (Binned with dynamic hover breakdown)
             if not next_5_mid.empty:
-                mid_val_sum = next_5_mid["Market Value"].sum()
+                mid_val_sum = next_5_mid["Value"].sum()
                 mid_pct_sum = next_5_mid["Percentage"].sum()
-                mid_lines = [f"• {r['Asset']}: ${r['Market Value']:,.2f} ({r['Percentage']:.1f}%)" for _, r in next_5_mid.iterrows()]
+                
+                # Compile dynamic hover data listing contents of the Mid-Tier bin
+                mid_lines = [f"• {r['Asset']}: ${r['Value']:,.2f} ({r['Percentage']:.1f}%)" for _, r in next_5_mid.iterrows()]
                 detailed_mid_hover = "<br><b>Group Holdings:</b><br>" + "<br>".join(mid_lines)
                 
                 final_slices.append({
@@ -273,18 +285,20 @@ if mode_selection == "Portfolio Dashboard":
                 })
                 hover_templates.append(f"<b>Next 5 Mid-Tier Holdings</b><br>Total Group Value: ${mid_val_sum:,.2f}<br>Total Group Weight: {mid_pct_sum:.1f}%{detailed_mid_hover}<extra></extra>")
                 
-            # Remaining Tail End Bin
+            # C. Troubleshooting Bin (Any other remaining assets spill over here)
             if not remaining_micro.empty:
-                rem_val_sum = remaining_micro["Market Value"].sum()
+                rem_val_sum = remaining_micro["Value"].sum()
                 rem_pct_sum = remaining_micro["Percentage"].sum()
-                rem_lines = [f"• {r['Asset']}: ${r['Market Value']:,.2f} ({r['Percentage']:.1f}%)" for _, r in remaining_micro.iterrows()]
+                
+                # Compile spillover breakdown hover list
+                rem_lines = [f"• {r['Asset']}: ${r['Value']:,.2f} ({r['Percentage']:.1f}%)" for _, r in remaining_micro.iterrows()]
                 detailed_rem_hover = "<br><b>Remaining Assets:</b><br>" + "<br>".join(rem_lines)
                 
                 final_slices.append({
                     "Asset": "Other Remaining Positions",
                     "Value": rem_val_sum,
                     "Percentage": rem_pct_sum,
-                    "StaticLabel": "" 
+                    "StaticLabel": "" # Hidden static text prevents chart clumping
                 })
                 hover_templates.append(f"<b>Other Tail End Assets</b><br>Combined Spillover Value: ${rem_val_sum:,.2f}<br>Combined Spillover Weight: {rem_pct_sum:.1f}%{detailed_rem_hover}<extra></extra>")
 
@@ -305,18 +319,18 @@ if mode_selection == "Portfolio Dashboard":
             )])
             
             fig_pie.update_layout(
-                title=dict(text="🎯 Real-Time Strategic Asset Allocation Weighting", x=0.5, y=0.97, font=dict(size=18, color="#ffffff")),
+                title=dict(text="🎯 Real-Time Strategic Asset Allocation Weighting", x=0.5, y=0.97, font=dict(size=18, family="Helvetica Neue, Arial, sans-serif", color="#ffffff")),
                 height=650, 
                 template="plotly_dark",
                 margin=dict(l=40, r=40, t=90, b=80), 
                 showlegend=True,
-                legend=dict(orientation="h", yanchor="top", y=-0.05, xanchor="center", x=0.5)
+                legend=dict(orientation="h", yanchor="top", y=-0.05, xanchor="center", x=0.5, font=dict(size=11, color="#cccccc"))
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
-        # 5. Interactive High-Precision Data Table
+        # 4. Fully Interactive High-Precision Position Editor Table
         st.subheader("📋 Your Monitored Assets Summary")
-        st.write("💡 *Double-click any cell under 'Shares' or 'Avg Cost' to edit your holdings inline.*")
+        st.write("💡 *Tip: Double-click any cell under 'Shares' or 'Avg Cost' to edit your holdings right inside the table row.*")
         
         df_summary = pd.DataFrame(display_data)
         
@@ -324,7 +338,8 @@ if mode_selection == "Portfolio Dashboard":
             df_summary,
             column_config={
                 "Asset": st.column_config.TextColumn("Asset", disabled=True),
-                "Shares": st.column_config.NumberColumn("Shares", min_value=0.0, format="%.5f", step=0.00001),
+                # shares upgraded to support up to 5 decimal significant figures
+                "Shares": st.column_config.NumberColumn("Shares owned", min_value=0.0, format="%.5f", step=0.00001),
                 "Avg Cost": st.column_config.NumberColumn("Avg Cost ($)", min_value=0.0, format="$%.5f", step=0.00001),
                 "Current Price": st.column_config.NumberColumn("Current Price", disabled=True, format="$%.5f"),
                 "Market Value": st.column_config.NumberColumn("Market Value", disabled=True, format="$%.2f"),
@@ -337,6 +352,7 @@ if mode_selection == "Portfolio Dashboard":
             key="portfolio_inline_editor"
         )
         
+        # Commit inline modifications back to session state on save
         if st.button("💾 Save Table Modifications", type="primary"):
             has_changes = False
             for idx, row in edited_df.iterrows():
@@ -345,7 +361,7 @@ if mode_selection == "Portfolio Dashboard":
                 target_cost = float(row["Avg Cost"])
                 baseline = st.session_state.user_portfolio.get(clean_ticker, {"shares": 0.0, "cost": 0.0})
                 
-                # Check for updates
+                # Check for significant numerical deviations using float tolerance
                 if abs(target_shares - float(baseline["shares"])) > 1e-7 or abs(target_cost - float(baseline["cost"])) > 1e-7:
                     has_changes = True
                     if target_shares == 0:
@@ -360,80 +376,82 @@ if mode_selection == "Portfolio Dashboard":
             else:
                 st.info("No modifications detected.")
 
-        # 6. Holistic AI Reporting Engine
+        # 5. Holistic AI Reporting Engine
         st.markdown("---")
         st.subheader("🧠 Holistic Wealth & Diversification Audit")
+        st.write("Passes your entire portfolio to Gemini to run cross-asset correlation checks and risk reviews.")
         
         if st.button("Generate Full Portfolio AI Macro Report"):
             if not api_key:
                 st.error("⚠️ Gemini API Key required.")
             else:
                 with st.spinner("Executing structural asset-correlation matrix analysis..."):
+                    # Cast summary view back to formatted string representation for the AI context
                     ai_export_df = edited_df.copy()
+                    ai_export_df["Shares"] = ai_export_df["Shares"].map(lambda x: f"{x:.5f}")
                     ai_export_df["Market Value"] = ai_export_df["Market Value"].map(lambda x: f"${x:,.2f}")
                     ai_export_df["Return ($)"] = ai_export_df["Return ($)"].map(lambda x: f"${x:,.2f}")
                     ai_export_df["Return (%)"] = ai_export_df["Return (%)"].map(lambda x: f"{x:.1f}%")
                     
-                    prompt = f"""
-                    You are an elite Wall Street Managing Director. Review this client portfolio:
-                    Total AUM: ${total_market_value:,.2f}
-                    Cost Basis: ${total_cost_basis:,.2f}
-                    Returns: ${total_gain:,.2f} ({total_gain_pct:.2f}%)
+                    portfolio_analysis_prompt = f"""
+                    You are an elite Wall Street Managing Director and Chief Wealth Management Strategist. 
+                    Perform a high-level strategic review on this client investment portfolio matrix:
+                    Total Wealth Under Management: ${total_market_value:,.2f}
+                    Consolidated Cost Basis: ${total_cost_basis:,.2f}
+                    Net Unreleased Returns: ${total_gain:,.2f} ({total_gain_pct:.2f}%)
                     
-                    Holdings: {ai_export_df.to_json(orient="records", indent=2)}
-                    Rule: {sma_period}-Day {ma_type}.
+                    Held Asset Layout:
+                    {ai_export_df.to_json(orient="records", indent=2)}
+                    
+                    Active Macro Tracking Rule: {sma_period}-Day lookback using {ma_type} parameters.
 
-                    Provide:
-                    1. A Markdown table 'Portfolio Diversification Analysis'.
-                    2. Macro Risk & Correlation Assessment.
-                    3. Actionable Rebalancing Recommendations.
-                    4. A final bolded 'Chief Investment Officer Mandate'.
+                    Provide a comprehensive executive advisory response with the following exact components:
+                    1. A Markdown table named 'Portfolio Diversification Analysis' ranking assets by capital weight, concentration tier, and risk status.
+                    2. Macro Risk & Correlation Assessment explicitly auditing underlying vulnerabilities (sector over-exposure, cash balance lags).
+                    3. Actionable Rebalancing Recommendations detailing exactly which assets to hold, skim, or accumulate.
+                    4. A final bolded 'Chief Investment Officer (CIO) Mandate' outlining immediate steps for wealth preservation and capital growth.
                     """
                     try:
                         client = genai.Client(api_key=api_key)
-                        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+                        response = client.models.generate_content(model='gemini-2.5-flash', contents=portfolio_analysis_prompt)
                         st.markdown(response.text)
                     except Exception as e:
                         st.error(f"AI Engine Error: {e}")
         
-        # 7. Single Asset Chart Drill-Down
+        # 6. Single Asset Chart Drill-Down
         st.markdown("---")
         st.subheader("🎯 Single Asset Chart Drill-Down")
-        selected_chart_ticker = st.selectbox("Select holding for historical indicators", options=list(st.session_state.user_portfolio.keys()))
+        selected_chart_ticker = st.selectbox("Choose a holding select for historical indicators", options=list(st.session_state.user_portfolio.keys()))
         
         if selected_chart_ticker in saved_charts and saved_charts[selected_chart_ticker] is not None:
             st.plotly_chart(saved_charts[selected_chart_ticker], use_container_width=True)
 
 # ==========================================
-# MODE 2: SINGLE TICKER ANALYSIS
+# MODE 2: SINGLE TICKER TEAR SHEET
 # ==========================================
 elif mode_selection == "Analyze Single Ticker":
     user_ticker = st.text_input("Enter Stock Ticker:").upper()
     if user_ticker and st.button("Generate Tear Sheet"):
-        if not api_key: 
-            st.error("⚠️ Gemini API Key required.")
+        if not api_key: st.error("⚠️ Gemini API Key required.")
         else:
             with st.spinner("Crunching data..."):
                 passed, metrics, fig, _ = fetch_technical_data(user_ticker, sma_period, ma_type)
-                if fig is not None: 
-                    st.plotly_chart(fig, use_container_width=True)
+                if fig is not None: st.plotly_chart(fig, use_container_width=True)
                 try:
                     client = genai.Client(api_key=api_key)
                     response = client.models.generate_content(
                         model='gemini-2.5-flash',
-                        contents=f"Institutional Assessment for {user_ticker}. Data: {metrics}. Apply {sma_period}-day {ma_type}. Generate Tear Sheet table, Elliott Wave map, and Analyst Verdict."
+                        contents=f"Institutional Analyst Assessment for {user_ticker}. Financial Profile: {metrics}. Apply {sma_period}-day {ma_type} overlay. Generate Quantitative Screen Tear Sheet table, Elliott Wave psychological map, and final bolded Analyst Verdict."
                     )
                     st.markdown(response.text)
-                except Exception as e: 
-                    st.error(f"Error: {e}")
+                except Exception as e: st.error(f"Error: {e}")
 
 # ==========================================
 # MODE 3: MARKET SCANNER
 # ==========================================
 elif mode_selection == "Run Market Scanner":
     if st.button("Launch Scan Now"):
-        if not api_key: 
-            st.error("⚠️ Gemini API Key required.")
+        if not api_key: st.error("⚠️ Gemini API Key required.")
         else:
             triggered_stocks = []
             saved_figs = {}
