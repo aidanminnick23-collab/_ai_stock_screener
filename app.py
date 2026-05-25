@@ -16,7 +16,8 @@ api_key = st.text_input("🔑 Enter Gemini API Key", type="password")
 # Predefined pool to scan
 TICKER_POOL = ["PLSE", "BRCB", "CELH", "SOFI", "HOOD", "DKNG"]
 
-# Interval Selection Mapping
+# NEW: Interval Selection Mapping
+# Pairs user selection with the minimum safe data window required for calculation
 INTERVAL_MAPPING = {
     10: {"history": "3mo", "description": "Short-term momentum & micro-trends"},
     20: {"history": "6mo", "description": "Standard short-term trend-following boundary"},
@@ -25,85 +26,64 @@ INTERVAL_MAPPING = {
     200: {"history": "2y", "description": "Long-term macro baseline (The ultimate bull/bear line)"}
 }
 
-# Layout Setup: Interactive selectors placed side-by-side
-col1, col2 = st.columns(2)
+# Dynamic UI Selector for SMA Duration
+sma_period = st.selectbox(
+    "📈 Select Moving Average (SMA) Duration",
+    options=list(INTERVAL_MAPPING.keys()),
+    index=1, # Defaults to 20
+    format_func=lambda x: f"{x}-Day SMA ({INTERVAL_MAPPING[x]['description']})"
+)
 
-with col1:
-    ma_type = st.radio(
-        "📐 Select Average Methodology",
-        options=["Simple Moving Average (SMA)", "Weighted Moving Average (WMA)"],
-        help="SMA treats all days equally. WMA gives heavier statistical weight to recent days."
-    )
-
-with col2:
-    sma_period = st.selectbox(
-        "📈 Select Lookback Duration",
-        options=list(INTERVAL_MAPPING.keys()),
-        index=1, # Defaults to 20
-        format_func=lambda x: f"{x}-Day Window"
-    )
-
-st.caption(f"**Current Configuration Strategy:** {INTERVAL_MAPPING[sma_period]['description']}")
-
-# Advanced adaptive data processing engine supporting SMA and WMA calculations
-def fetch_technical_data(ticker_symbol, period_window, calculation_type):
+# Advanced adaptive data processing engine
+def fetch_technical_data(ticker_symbol, period_window):
     try:
         ticker = yf.Ticker(ticker_symbol)
+        
+        # Dynamically allocate historical lookback period based on SMA choice
         lookback = INTERVAL_MAPPING[period_window]["history"]
         hist = ticker.history(period=lookback)
         
         if hist.empty or len(hist) < period_window:
             return False, {}, None
         
-        # --- Dynamic Core Math Block ---
-        if "Simple" in calculation_type:
-            hist['MA_Line'] = hist['Close'].rolling(window=period_window).mean()
-            ma_acronym = "SMA"
-        else:
-            # Generate a linear weighting array (e.g., [1, 2, 3... N] for an N-day window)
-            linear_weights = np.arange(1, period_window + 1)
-            # Apply rolling custom linear dot-product to prices
-            hist['MA_Line'] = hist['Close'].rolling(window=period_window).apply(
-                lambda prices: np.dot(prices, linear_weights) / linear_weights.sum(), 
-                raw=True
-            )
-            ma_acronym = "WMA"
-            
+        # Calculate Dynamic Technical Indicators
+        sma_col = f'SMA_{period_window}'
+        hist[sma_col] = hist['Close'].rolling(window=period_window).mean()
         hist['Prev_Close'] = hist['Close'].shift(1)
-        hist['Prev_MA'] = hist['MA_Line'].shift(1)
+        hist['Prev_SMA'] = hist[sma_col].shift(1)
         
-        # Algorithmic Crossover Signals mapped to the dynamic line output
-        buy_condition = (hist['Close'] > hist['MA_Line']) & (hist['Prev_Close'] <= hist['Prev_MA'])
-        sell_condition = (hist['Close'] < hist['MA_Line']) & (hist['Prev_Close'] >= hist['Prev_MA'])
+        # Define algorithmic Crossover Signals based on dynamic boundaries
+        buy_condition = (hist['Close'] > hist[sma_col]) & (hist['Prev_Close'] <= hist['Prev_SMA'])
+        sell_condition = (hist['Close'] < hist[sma_col]) & (hist['Prev_Close'] >= hist['Prev_SMA'])
         
         hist['Buy_Signal'] = np.where(buy_condition, hist['Close'], np.nan)
         hist['Sell_Signal'] = np.where(sell_condition, hist['Close'], np.nan)
         
-        # Capture parameters
+        # Capture current conditions
         current_price = hist['Close'].iloc[-1]
         prior_price = hist['Close'].iloc[-20] if len(hist) >= 20 else hist['Close'].iloc[0]
         one_month_change = ((current_price - prior_price) / prior_price) * 100
-        current_ma_val = hist['MA_Line'].iloc[-1]
+        current_sma = hist[sma_col].iloc[-1]
         
-        # Determine latest trigger timestamps
+        # Determine latest structural signal state and historical dates
         latest_signal = "Neutral (Consolidating)"
         recent_buys = hist['Buy_Signal'].dropna()
         recent_sells = hist['Sell_Signal'].dropna()
         
         if not recent_buys.empty and (recent_sells.empty or recent_buys.index[-1] > recent_sells.index[-1]):
-            latest_signal = f"Active BUY Trigger (Price crossed ABOVE the {period_window}-day {ma_acronym} on {recent_buys.index[-1].strftime('%m/%d/%Y')})"
+            latest_signal = f"Active BUY Trigger (Price crossed ABOVE the {period_window}-day SMA on {recent_buys.index[-1].strftime('%m/%d/%Y')})"
         elif not recent_sells.empty and (recent_buys.empty or recent_sells.index[-1] > recent_buys.index[-1]):
-            latest_signal = f"Active SELL Trigger (Price crossed BELOW the {period_window}-day {ma_acronym} on {recent_sells.index[-1].strftime('%m/%d/%Y')})"
+            latest_signal = f"Active SELL Trigger (Price crossed BELOW the {period_window}-day SMA on {recent_sells.index[-1].strftime('%m/%d/%Y')})"
 
         metrics = {
             "Price": f"${current_price:.2f}",
             "Approx. 1-Mo Momentum": f"{one_month_change:.1f}%",
-            f"{period_window}-Day {ma_acronym} Value": f"${current_ma_val:.2f}",
+            f"{period_window}-Day SMA Value": f"${current_sma:.2f}",
             "Algorithmic Trend State": latest_signal,
-            "Calculation Methodology": calculation_type
+            "Lookback Window Applied": lookback
         }
         
-        # Build the Plotly visualization chart
+        # Build the dynamic Plotly visualization chart
         fig = go.Figure()
         
         # Underlying Price Line
@@ -112,29 +92,32 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
             line=dict(color='#1f77b4', width=2.5)
         ))
         
-        # Dynamic Overlay Line (Swaps dynamically between SMA and WMA styles)
-        line_color = '#ff7f0e' if ma_acronym == "SMA" else '#9467bd'
+        # Dynamic Moving Average Overlay
         fig.add_trace(go.Scatter(
-            x=hist.index, y=hist['MA_Line'], name=f'{period_window}-Day {ma_acronym}',
-            line=dict(color=line_color, width=1.5, dash='dash' if ma_acronym == "SMA" else 'solid')
+            x=hist.index, y=hist[sma_col], name=f'{period_window}-Day SMA',
+            line=dict(color='#ff7f0e', width=1.5, dash='dash')
         ))
         
-        # Visual Buy/Sell Markers
+        # Visual Buy Markers
         fig.add_trace(go.Scatter(
             x=hist.index, y=hist['Buy_Signal'], mode='markers', name='BUY Signal',
             marker=dict(color='#2ca02c', size=11, symbol='triangle-up', line=dict(width=1, color='black'))
         ))
+        
+        # Visual Sell Markers
         fig.add_trace(go.Scatter(
             x=hist.index, y=hist['Sell_Signal'], mode='markers', name='SELL Signal',
             marker=dict(color='#d62728', size=11, symbol='triangle-down', line=dict(width=1, color='black'))
         ))
         
         fig.update_layout(
-            title=f"Technical Trend Analysis Overview ({ticker_symbol} - {period_window} Day {ma_acronym})",
-            xaxis_title="Date", yaxis_title="Price ($)",
+            title=f"Technical Trend Analysis Overview ({ticker_symbol} - {period_window} Day Horizon)",
+            xaxis_title="Date",
+            yaxis_title="Price ($)",
             hovermode="x unified",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=10, r=10, t=40, b=10), template="plotly_dark"
+            margin=dict(l=10, r=10, t=40, b=10),
+            template="plotly_dark"
         )
         
         passed = one_month_change > 0
@@ -145,41 +128,41 @@ def fetch_technical_data(ticker_symbol, period_window, calculation_type):
 
 mode = st.radio("Select Mode", ["Analyze Single Ticker", "Run Market Scanner (Buy Trigger)"])
 
-# Programmed the system instructions to analyze the exact architectural variant chosen
+# Configured the prompt template to ingest the chosen lookback scope context dynamically
 analysis_prompt_template = """
-You are an institutional-grade Wall Street Equity Analyst.
-Analyze the following data parameters for ticker {ticker}:
+You are an institutional-grade Wall Street Equity Analyst specializing in macro technical frameworks. 
+Analyze the following data for ticker {ticker}:
 Live Calculated Technical Metrics: {metrics}
-Selected Strategy Horizon: {window}-Day lookback using {method} rules.
+Selected Time Horizon Scope: {window}-Day Simple Moving Average
 
 Provide a response with the following exact components:
-1. A Markdown table named 'Quantitative Screen Tear Sheet' detailing all the calculated metrics provided, what institutional analysts look for when applying a {window}-day {method} boundary configuration, and their current screen status. 
-2. A beginner-friendly breakdown defining the difference between equal-weight calculations and linear-weighting distribution using intuitive real-world analogies based on the selected setting.
-3. An Elliott Wave Technical Perspective mapping market psychology and current presumed wave structures. If WMA was selected, focus heavily on near-term sensitivity and momentum lag minimization. If SMA was selected, focus on structural institutional support walls and macro behavioral cycles.
-4. A bolded final 'Analyst Verdict' summarizing the clear risk profile and signal validation.
+1. A Markdown table named 'Quantitative Screen Tear Sheet' detailing all the calculated metrics provided, what institutional analysts look for when using a {window}-day scope, and their current screen status. Include the specific date of the last active trigger if noted.
+2. A beginner-friendly breakdown defining the technical crossover mechanics of a {window}-day average using intuitive real-world analogies.
+3. An Elliott Wave Technical Perspective mapping market psychology and current presumed wave structures based on how price interacts with this specific {window}-day macro framework.
+4. A bolded final 'Analyst Verdict' summarizing the specific risk profile and signal confirmation.
 """
 
 if mode == "Analyze Single Ticker":
-    user_ticker = st.text_input("Enter Stock Ticker (e.g., CELH):").upper()
+    user_ticker = st.text_input("Enter Stock Ticker (e.g., HOOD):").upper()
     if user_ticker and st.button("Generate Tear Sheet"):
         if not api_key:
             st.error("⚠️ You must enter your Gemini API Key first!")
         else:
             with st.spinner("Processing market charts and data streams..."):
-                passed, metrics, fig = fetch_technical_data(user_ticker, sma_period, ma_type)
+                passed, metrics, fig = fetch_technical_data(user_ticker, sma_period)
                 
                 if fig is not None:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.warning("Could not render historical charts. Try a shorter lookback window if history is limited.")
-                    metrics = {"Price": "Data pipeline restriction, verifying parameters via synthesis."}
+                    st.warning("Could not render historical charts. Try a shorter SMA window if this ticker has limited trading history.")
+                    metrics = {"Price": "Data pipeline restriction, verifying core parameters via synthesis."}
                 
                 with st.spinner("Executing structural AI evaluation..."):
                     try:
                         client = genai.Client(api_key=api_key)
                         response = client.models.generate_content(
                             model='gemini-2.5-flash',
-                            contents=analysis_prompt_template.format(ticker=user_ticker, metrics=metrics, window=sma_period, method=ma_type)
+                            contents=analysis_prompt_template.format(ticker=user_ticker, metrics=metrics, window=sma_period)
                         )
                         st.markdown(response.text)
                     except Exception as e:
@@ -190,18 +173,18 @@ elif mode == "Run Market Scanner (Buy Trigger)":
         if not api_key:
             st.error("⚠️ You must enter your Gemini API Key first!")
         else:
-            st.write(f"Scanning watchlists using a {sma_period}-day {ma_type} trend threshold...")
+            st.write(f"Scanning institutional watchlists using a {sma_period}-day operational threshold...")
             triggered_stocks = []
             saved_figs = {}
             
             for ticker in TICKER_POOL:
-                passed, metrics, fig = fetch_technical_data(ticker, sma_period, ma_type)
+                passed, metrics, fig = fetch_technical_data(ticker, sma_period)
                 if passed and fig is not None:
                     triggered_stocks.append({"Ticker": ticker, **metrics})
                     saved_figs[ticker] = fig
             
             if triggered_stocks:
-                st.success(f"Found {len(triggered_stocks)} assets demonstrating technical momentum relative to the selected line configuration!")
+                st.success(f"Found {len(triggered_stocks)} assets demonstrating technical momentum relative to the {sma_period}-day line!")
                 st.dataframe(triggered_stocks)
                 
                 top_stock = triggered_stocks[0]["Ticker"]
@@ -214,7 +197,7 @@ elif mode == "Run Market Scanner (Buy Trigger)":
                         client = genai.Client(api_key=api_key)
                         response = client.models.generate_content(
                             model='gemini-2.5-flash',
-                            contents=analysis_prompt_template.format(ticker=top_stock, metrics=triggered_stocks[0], window=sma_period, method=ma_type)
+                            contents=analysis_prompt_template.format(ticker=top_stock, metrics=triggered_stocks[0], window=sma_period)
                         )
                         st.markdown(response.text)
                     except Exception as e:
