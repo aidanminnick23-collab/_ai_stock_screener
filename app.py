@@ -1,6 +1,6 @@
 import streamlit as st
 import yfinance as yf
-from google import genai  # Updated to modern 2026 SDK
+from google import genai  
 
 st.title("📊 Wall Street AI Scanner & Tear Sheet Tool")
 st.write("Scans tickers, applies a quantitative 'Buy Trigger', and generates AI insights.")
@@ -57,10 +57,10 @@ if mode == "Analyze Single Ticker":
                     metrics = {"Price": "Data fetch restricted, relying on AI synthesis."}
                 
                 try:
-                    # Updated client construction and modern gemini-2.5-pro model execution
+                    # FIXED: Changed model to gemini-2.5-flash to unlock the active free tier
                     client = genai.Client(api_key=api_key)
                     response = client.models.generate_content(
-                        model='gemini-2.5-pro',
+                        model='gemini-2.5-flash',
                         contents=analysis_prompt_template.format(ticker=user_ticker, metrics=metrics)
                     )
                     st.markdown(response.text)
@@ -89,10 +89,10 @@ elif mode == "Run Market Scanner (Buy Trigger)":
                 
                 with st.spinner("Executing Wall Street evaluation..."):
                     try:
-                        # Updated client construction and modern gemini-2.5-pro model execution
+                        # FIXED: Changed model to gemini-2.5-flash to unlock the active free tier
                         client = genai.Client(api_key=api_key)
                         response = client.models.generate_content(
-                            model='gemini-2.5-pro',
+                            model='gemini-2.5-flash',
                             contents=analysis_prompt_template.format(ticker=top_stock, metrics=triggered_stocks[0])
                         )
                         st.markdown(response.text)
