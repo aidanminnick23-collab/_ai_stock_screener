@@ -1,8 +1,8 @@
 # ================================================================
-# WALL STREET AI DASHBOARD — Production Build v2.4
-# Fix: Sidebar DeltaGenerator rendering (ternary → if/else)
-# New: Inline editable portfolio table (edit/delete/add positions)
-# New: Crypto ticker warning (ETH → ETH-USD detection)
+# WALL STREET AI DASHBOARD — Production Build v2.5
+# New: EMA (Exponential Moving Average) — now the recommended default
+# Improved: Crypto handling — auto-detect and auto-normalize tickers,
+#           no toggle, no warning banners, clean UX
 # ================================================================
 
 import streamlit as st
@@ -66,11 +66,16 @@ CRYPTO_TICKERS = {
     "XRP": "XRP-USD", "Solana (SOL)": "SOL-USD",
 }
 
-# Known crypto base symbols that MUST have -USD appended
+# Comprehensive set of crypto base symbols — auto-normalised to SYMBOL-USD on save
 KNOWN_CRYPTO_SYMBOLS = {
     "BTC", "ETH", "XRP", "SOL", "DOGE", "ADA", "DOT", "AVAX",
     "MATIC", "LINK", "LTC", "BCH", "UNI", "ATOM", "FIL", "ALGO",
     "VET", "THETA", "TRX", "EOS", "XLM", "NEO", "IOTA", "DASH",
+    "SHIB", "PEPE", "WIF", "BONK", "SUI", "APT", "ARB", "OP",
+    "INJ", "NEAR", "FTM", "HBAR", "ICP", "SAND", "MANA", "AXS",
+    "CRO", "EGLD", "FLOW", "CHZ", "ZEC", "XTZ", "AAVE", "MKR",
+    "SNX", "COMP", "YFI", "SUSHI", "CRV", "1INCH", "BAT", "ENJ",
+    "GRT", "BAL", "ZRX", "LRC", "SKL", "STORJ", "BNT", "REN",
 }
 
 INTERVAL_MAP = {
@@ -94,7 +99,6 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
 }
-
 _BUY_KEYWORDS   = ["purchase", "bought", "acqui"]
 _SELL_KEYWORDS  = ["sale", "sold"]
 _NOISE_KEYWORDS = ["gift", "award", "grant", "automatic", "plan sale",
@@ -102,31 +106,85 @@ _NOISE_KEYWORDS = ["gift", "award", "grant", "automatic", "plan sale",
                    "return", "forfeiture", "conversion"]
 
 # ================================================================
-# INDICATOR GUIDE
+# TICKER NORMALISATION
+# Smart crypto auto-detection — no toggle needed anywhere in the UI
+# ================================================================
+def normalize_ticker(raw: str) -> str:
+    """
+    Cleans and auto-normalises any ticker the user types.
+    - Strips whitespace and uppercases
+    - If the symbol is a known crypto base (ETH, BTC, XRP …) and
+      does NOT already end in -USD, appends -USD automatically
+    - Everything else is returned as-is
+    Examples:
+        "eth"     → "ETH-USD"
+        "ETH-USD" → "ETH-USD"   (already correct, untouched)
+        "aapl"    → "AAPL"
+        "NVDA"    → "NVDA"
+    """
+    t = raw.upper().strip()
+    if not t:
+        return t
+    # If user typed "ETH-USD" already, honour it
+    if t.endswith("-USD"):
+        return t
+    # If the base symbol is in our crypto list, auto-append -USD
+    if t in KNOWN_CRYPTO_SYMBOLS:
+        return t + "-USD"
+    return t
+
+def ticker_label(ticker: str) -> str:
+    """
+    Human-friendly display name for portfolio tables.
+    Turns 'ETH-USD' → 'ETH', 'BTC-USD' → 'BTC', 'NVDA' → 'NVDA'.
+    Keeps full ticker in the tooltip via the table's column config.
+    """
+    if ticker.endswith("-USD"):
+        base = ticker[:-4]
+        if base in KNOWN_CRYPTO_SYMBOLS:
+            return base
+    return ticker
+
+# ================================================================
+# INDICATOR GUIDE  (updated with EMA section)
 # ================================================================
 def render_indicator_guide():
     with st.expander("📚  Indicator Guide — What does everything mean?  (click to expand)", expanded=False):
         st.markdown("#### Learn the indicators used in every chart and analysis report")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown("---\n### 📈 Moving Average (SMA / WMA)")
-            st.info("**What it is:** Average closing price over N days. SMA weights every day equally; WMA gives more weight to recent days.\n\n**Think of it as:** The stock's center of gravity — prices drift back toward it.\n\n🔺 Green triangle = crossed above → Buy signal\n🔻 Red triangle = crossed below → Sell signal")
+            st.markdown("---\n### 📈 Moving Averages: SMA, EMA & WMA")
+            st.info(
+                "All three smooth out daily price noise to reveal the underlying trend. "
+                "They differ only in **how much weight** they give to recent vs older prices.\n\n"
+                "**SMA (Simple):** Every day in the window gets equal weight. "
+                "Slow and stable — best for long-term trend confirmation (e.g. the 200-day SMA).\n\n"
+                "**EMA (Exponential) ⭐ Recommended:** Uses exponential decay — recent days matter "
+                "much more than older ones, but no day is ever fully forgotten. Reacts faster than "
+                "SMA with far less noise than WMA. This is what professional desks, Bloomberg "
+                "terminals, and the MACD formula itself all use.\n\n"
+                "**WMA (Weighted):** Linear weighting — yesterday gets the highest weight, "
+                "day-before gets slightly less, and so on. Fastest reaction but most prone to "
+                "false signals in choppy markets. Rarely used by institutions.\n\n"
+                "🔺 Green triangle = price crossed above MA → Buy signal\n"
+                "🔻 Red triangle = price crossed below MA → Sell signal"
+            )
             st.markdown("---\n### 📉 RSI — Relative Strength Index")
             st.info("**What it is:** A 0–100 speed gauge for recent price movement (14-day).\n\n**Think of it as:** A runner's fatigue meter. Sprinting too long (>70) leads to a slowdown.\n\n🔴 Above 70 = Overbought\n🟢 Below 30 = Oversold\n⚪ 30–70 = Neutral")
-            st.markdown("---\n### 📊 Volume")
-            st.info("**What it is:** Total shares traded. Validates whether a move has real conviction.\n\n**Think of it as:** Votes. Rising price + heavy volume = confirmed move.\n\n🟢 Rising price + High volume = Confirmed\n🔴 Rising price + Low volume = Suspect")
         with c2:
             st.markdown("---\n### ⚡ MACD")
-            st.info("**What it is:** Compares fast (12-day) vs slow (26-day) EMA.\n\n**Think of it as:** Two pace cars — when the fast car leads, buyers are accelerating.\n\n🟢 MACD above Signal = Bullish\n🔴 MACD below Signal = Bearish\n📊 Histogram growing = Momentum strengthening")
+            st.info("**What it is:** Compares a fast EMA (12-day) vs slow EMA (26-day). Already uses EMA internally — another reason EMA is the natural choice for your main MA line too.\n\n🟢 MACD above Signal = Bullish\n🔴 MACD below Signal = Bearish\n📊 Histogram growing = Momentum strengthening")
             st.markdown("---\n### 🎯 Bollinger Bands")
             st.info("**What it is:** 20-day MA ± 2 standard deviations.\n\n**Think of it as:** Highway lanes — price drifts to the edge then snaps back.\n\n🔴 At upper band = Overbought\n🟢 At lower band = Oversold\n⚠️ Squeeze = Breakout incoming")
+            st.markdown("---\n### 📊 Volume")
+            st.info("**What it is:** Total shares traded. Validates whether a move has real conviction.\n\n🟢 Rising price + High volume = Confirmed move\n🔴 Rising price + Low volume = Suspect move")
             st.markdown("---\n### 👔 Insider / CEO Buying")
-            st.info("**What it is:** Purchases by executives/directors via SEC Form 4 filings. Only **open market purchases** (personal cash) are meaningful.\n\n🟢 CEO buying with cash = Strongest bullish signal\n🔴 Heavy selling = Caution\n📌 3+ insiders buying = Cluster buy (highest conviction)")
+            st.info("**What it is:** Purchases by executives via SEC Form 4. Only open-market purchases (personal cash) are meaningful.\n\n🟢 CEO buying with cash = Strongest bullish signal\n📌 3+ insiders buying = Cluster buy (highest conviction)")
         with c3:
             st.markdown("---\n### 🌊 Elliott Wave Theory")
-            st.info("**The pattern:**\n- **Wave 1** — First move up; few notice\n- **Wave 2** — Pullback; 'Was that it?'\n- **Wave 3** — Strongest surge\n- **Wave 4** — Mild consolidation\n- **Wave 5** — Final push; euphoria\n- **Wave A–C** — Corrective phase\n\nThe AI identifies the likely current wave position.")
+            st.info("**The pattern:**\n- **Wave 1** — First move up; few notice\n- **Wave 2** — Pullback\n- **Wave 3** — Strongest surge\n- **Wave 4** — Mild consolidation\n- **Wave 5** — Final push; euphoria\n- **Wave A–C** — Corrective phase\n\nThe AI identifies the likely current wave position.")
             st.markdown("---\n### 📐 Fibonacci Retracement")
-            st.info("**What it is:** Key price zones markets tend to reverse at.\n\n🔵 **23.6%** — Shallow pullback\n🟢 **38.2%** — Common healthy dip\n🟡 **50.0%** — Psychological midpoint\n🟠 **61.8%** — Golden Ratio — strongest support\n🔴 **78.6%** — Deep retracement\n\nA bounce off 61.8% in an uptrend is one of the highest-probability setups in trading.")
+            st.info("**What it is:** Key price zones where markets tend to reverse.\n\n🔵 **23.6%** — Shallow pullback, strong trend\n🟢 **38.2%** — Common healthy dip\n🟡 **50.0%** — Psychological midpoint\n🟠 **61.8%** — The Golden Ratio — strongest support\n🔴 **78.6%** — Deep retracement\n\nA bounce off 61.8% in an uptrend is one of the highest-probability setups in technical analysis.")
 
 # ================================================================
 # PORTFOLIO AUTH
@@ -261,9 +319,9 @@ def get_insider_transactions(symbol):
         val_col   = _find(["value"])
 
         clean = pd.DataFrame()
-        if "Date"          in df.columns: clean["Date"]           = df["Date"]
-        if name_col:                      clean["Insider"]         = df[name_col]
-        if pos_col:                       clean["Role"]            = df[pos_col]
+        if "Date" in df.columns:   clean["Date"]           = df["Date"]
+        if name_col:               clean["Insider"]         = df[name_col]
+        if pos_col:                clean["Role"]            = df[pos_col]
         clean["Transaction Type"] = df["Transaction Type"]
         if share_col:
             clean["Shares"] = pd.to_numeric(df[share_col], errors="coerce").apply(
@@ -285,11 +343,11 @@ def insider_summary(df):
     buy_val  = df.loc[df["Transaction Type"] == "🟢 Open Market Buy",  "_raw_value"].sum() if "_raw_value" in df.columns else 0
     sell_val = df.loc[df["Transaction Type"] == "🔴 Open Market Sale", "_raw_value"].sum() if "_raw_value" in df.columns else 0
     summary = f"Insider open-market activity (last 12 months): {len(buys)} purchase(s) ~${buy_val:,.0f}, {len(sells)} sale(s) ~${sell_val:,.0f}. "
-    if len(buys) > 0 and len(sells) == 0:   summary += "✅ Buying with no selling — very bullish."
-    elif len(buys) >= 3:                     summary += "✅ Cluster insider buying — high conviction."
-    elif len(buys) > 0:                      summary += "Mild insider buying — modestly bullish."
-    elif sell_val > buy_val * 3 > 0:         summary += "⚠️ Heavy net insider selling — warrants caution."
-    else:                                    summary += "No open-market purchases detected."
+    if len(buys) > 0 and len(sells) == 0:  summary += "✅ Buying with no selling — very bullish."
+    elif len(buys) >= 3:                   summary += "✅ Cluster insider buying — high conviction."
+    elif len(buys) > 0:                    summary += "Mild insider buying — modestly bullish."
+    elif sell_val > buy_val * 3 > 0:       summary += "⚠️ Heavy net insider selling — warrants caution."
+    else:                                  summary += "No open-market purchases detected."
     return summary
 
 def generate_insider_ai_analysis(symbol, df):
@@ -313,32 +371,28 @@ Write a structured report with EXACTLY these four sections:
 
 ## 👔 Insider Transaction Summary Table
 Markdown table: | Date | Insider | Role | Transaction Type | Shares | Est. Value |
-Only include Open Market Buys and Open Market Sales. Exclude all Non-Market entries. Bold purchase rows.
+Only include Open Market Buys and Open Market Sales. Bold purchase rows.
 
 ## 🔍 Signal Interpretation
-- Who is buying or selling? Does their role make the action more/less meaningful?
-- Is this cluster buying? Why does that matter?
-- Are sales patterned (10b5-1 plans = pre-scheduled, less alarming) or discretionary?
-- What does the NET direction (buy value vs sell value) tell us?
-- For heavy selling scenarios: explain that executives sell for personal reasons (diversification, real estate, taxes) even when the business is strong
+- Who is buying or selling and does their role amplify the signal?
+- Is this cluster buying? Are sales pre-scheduled 10b5-1 plans (less alarming) or discretionary?
+- What does the net direction tell us?
 
 ## 📊 Historical Context
-- Is this level of insider activity typical, elevated, or unusual for a company this size?
-- What does academic research say about insider buying as a predictor of performance?
-- Any red flags or green flags in the specific transactions shown?
+- Is this level of activity typical or unusual for a company this size?
+- What does academic research say about insider buying as a predictor?
+- Any clear red flags or green flags?
 
 ## 🎯 Insider Signal Verdict
 **Bold conclusion:** Bullish / Neutral / Bearish Caution based ONLY on insider activity.
-How much weight should this carry alongside the technical indicators?
-One final sentence a beginner can immediately act on.
+How much weight alongside technical indicators? One sentence a beginner can act on.
 """
     errors = []
     for model in GEMINI_MODEL_CANDIDATES:
         try:
             response = gemini_client.models.generate_content(model=model, contents=prompt)
             return f"*Insider Analysis · Model: `{model}`*\n\n" + response.text
-        except Exception as e:
-            errors.append(f"**{model}:** {str(e)[:100]}")
+        except Exception as e: errors.append(f"**{model}:** {str(e)[:100]}")
     return "⚠️ AI analysis failed.\n\n" + "\n".join(f"- {e}" for e in errors)
 
 def render_insider_section(symbol):
@@ -347,7 +401,7 @@ def render_insider_section(symbol):
             df = get_insider_transactions(symbol)
         if df is None:
             st.info("No recent insider transaction data found."); return
-        st.caption("Source: SEC Form 4 filings via Yahoo Finance. Only Open Market transactions (personal cash) are meaningful signals.")
+        st.caption("Source: SEC Form 4 filings via Yahoo Finance. Only Open Market transactions signal genuine conviction.")
         show_noise = st.toggle("Show Non-Market entries (awards, grants, gifts)", value=False, key=f"noise_{symbol}")
         display_df = df if show_noise else df[df["Transaction Type"] != "⚪ Non-Market"]
         display_df = display_df[[c for c in display_df.columns if c != "_raw_value"]]
@@ -359,7 +413,6 @@ def render_insider_section(symbol):
                 if "Sale" in str(row.get("Transaction Type", "")): return ["background-color: rgba(244,67,54,0.08)"] * len(row)
                 return [""] * len(row)
             st.dataframe(display_df.style.apply(highlight_row, axis=1), use_container_width=True, hide_index=True)
-
         buys  = df[df["Transaction Type"] == "🟢 Open Market Buy"]
         sells = df[df["Transaction Type"] == "🔴 Open Market Sale"]
         other = df[df["Transaction Type"] == "⚪ Non-Market"]
@@ -372,14 +425,12 @@ def render_insider_section(symbol):
         net = len(buys) - len(sells)
         k4.metric("Net Signal", f"{'🟢 Bullish' if net > 0 else '🔴 Caution' if net < -2 else '⚪ Neutral'}",
                   delta=f"{abs(net)} tx net {'buying' if net > 0 else 'selling'}")
-
         ai_key = f"insider_ai_{symbol}"
         if st.button("🤖  AI Insider Signal Analysis", key=f"btn_{ai_key}"):
             with st.spinner("Analysing insider patterns…"):
                 st.session_state[ai_key] = generate_insider_ai_analysis(symbol, df)
         if ai_key in st.session_state:
-            st.markdown("---")
-            st.markdown(st.session_state[ai_key])
+            st.markdown("---"); st.markdown(st.session_state[ai_key])
             if st.button("🗑️  Clear Insider Report", key=f"clr_{ai_key}"):
                 del st.session_state[ai_key]; st.rerun()
 
@@ -392,7 +443,7 @@ def _cached_history(symbol, period):
     except: return pd.DataFrame()
 
 # ================================================================
-# CORE TECHNICAL ANALYSIS ENGINE
+# CORE TECHNICAL ANALYSIS ENGINE  (EMA added)
 # ================================================================
 def fetch_technical_data(symbol, period_window, calc_type):
     try:
@@ -402,35 +453,60 @@ def fetch_technical_data(symbol, period_window, calc_type):
         if hist.empty or len(hist) < min_bars: return False, {}, None, 0.0, {}
 
         close = hist["Close"]
-        if "Simple" in calc_type:
-            hist["MA"] = close.rolling(period_window).mean(); ma_label = f"SMA-{period_window}"
+
+        # ── Moving Average selection ───────────────────────────
+        if "Exponential" in calc_type:
+            # EMA: exponential decay weighting — reacts fast, stays smooth
+            # Same formula used internally by MACD and most institutional platforms
+            hist["MA"] = close.ewm(span=period_window, adjust=False).mean()
+            ma_label   = f"EMA-{period_window}"
+        elif "Simple" in calc_type:
+            hist["MA"] = close.rolling(period_window).mean()
+            ma_label   = f"SMA-{period_window}"
         else:
+            # WMA: linear decay weighting
             w = np.arange(1, period_window + 1)
-            hist["MA"] = close.rolling(period_window).apply(lambda p: np.dot(p, w) / w.sum(), raw=True)
+            hist["MA"] = close.rolling(period_window).apply(
+                lambda p: np.dot(p, w) / w.sum(), raw=True
+            )
             ma_label   = f"WMA-{period_window}"
 
+        # Bollinger Bands
         bb_mid = close.rolling(20).mean(); bb_std = close.rolling(20).std()
-        hist["BB_Upper"] = bb_mid + 2 * bb_std; hist["BB_Mid"] = bb_mid; hist["BB_Lower"] = bb_mid - 2 * bb_std
+        hist["BB_Upper"] = bb_mid + 2 * bb_std
+        hist["BB_Mid"]   = bb_mid
+        hist["BB_Lower"] = bb_mid - 2 * bb_std
 
+        # RSI
         delta = close.diff()
-        hist["RSI"] = 100 - (100 / (1 + delta.clip(lower=0).rolling(14).mean() / (-delta.clip(upper=0)).rolling(14).mean().replace(0, np.nan)))
+        hist["RSI"] = 100 - (100 / (1 + delta.clip(lower=0).rolling(14).mean() /
+                                     (-delta.clip(upper=0)).rolling(14).mean().replace(0, np.nan)))
 
-        ema12 = close.ewm(span=12, adjust=False).mean(); ema26 = close.ewm(span=26, adjust=False).mean()
-        hist["MACD"] = ema12 - ema26; hist["MACD_Sig"] = hist["MACD"].ewm(span=9, adjust=False).mean(); hist["MACD_H"] = hist["MACD"] - hist["MACD_Sig"]
+        # MACD  (always EMA-based regardless of MA type selection)
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        hist["MACD"]     = ema12 - ema26
+        hist["MACD_Sig"] = hist["MACD"].ewm(span=9, adjust=False).mean()
+        hist["MACD_H"]   = hist["MACD"] - hist["MACD_Sig"]
 
+        # Fibonacci
         sh = float(close.max()); sl = float(close.min())
         fib_levels = {lbl: sl + r * (sh - sl) for lbl, r in FIB_RATIOS.items()}
 
+        # Crossover signals
         prev_close = close.shift(1); prev_ma = hist["MA"].shift(1)
         hist["Buy"]  = np.where((close > hist["MA"]) & (prev_close <= prev_ma), close, np.nan)
         hist["Sell"] = np.where((close < hist["MA"]) & (prev_close >= prev_ma), close, np.nan)
 
+        # Snapshot values
         cur_price = float(close.iloc[-1]); cur_ma = float(hist["MA"].iloc[-1])
-        cur_rsi   = float(hist["RSI"].iloc[-1]); cur_macd = float(hist["MACD"].iloc[-1]); cur_sig = float(hist["MACD_Sig"].iloc[-1])
+        cur_rsi   = float(hist["RSI"].iloc[-1])
+        cur_macd  = float(hist["MACD"].iloc[-1]); cur_sig = float(hist["MACD_Sig"].iloc[-1])
         cur_bbu   = float(hist["BB_Upper"].iloc[-1]); cur_bbl = float(hist["BB_Lower"].iloc[-1])
         prior     = close.iloc[-20] if len(hist) >= 20 else close.iloc[0]
         momentum  = ((cur_price - float(prior)) / float(prior)) * 100
-        avg_vol   = float(hist["Volume"].rolling(20).mean().iloc[-1]); last_vol = float(hist["Volume"].iloc[-1])
+        avg_vol   = float(hist["Volume"].rolling(20).mean().iloc[-1])
+        last_vol  = float(hist["Volume"].iloc[-1])
         vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
         nearest_fib  = min(fib_levels.items(), key=lambda x: abs(x[1] - cur_price))
         fib_distance = ((cur_price - nearest_fib[1]) / nearest_fib[1]) * 100
@@ -444,8 +520,10 @@ def fetch_technical_data(symbol, period_window, calc_type):
             ma_signal = "⚪ Neutral"; is_bullish = momentum > 0
 
         metrics = {
-            "Price":           f"${cur_price:.2f}", "1-Mo Momentum": f"{momentum:+.1f}%",
-            f"{ma_label}":     f"${cur_ma:.2f}", "MA Signal": ma_signal,
+            "Price":           f"${cur_price:.2f}",
+            "1-Mo Momentum":   f"{momentum:+.1f}%",
+            f"{ma_label}":     f"${cur_ma:.2f}",
+            "MA Signal":       ma_signal,
             "RSI (14)":        f"{cur_rsi:.1f} — " + ("🔴 Overbought" if cur_rsi > 70 else "🟢 Oversold" if cur_rsi < 30 else "⚪ Neutral"),
             "MACD":            "🟢 Bullish cross" if cur_macd > cur_sig else "🔴 Bearish cross",
             "Bollinger":       "🔴 At upper band" if cur_price >= cur_bbu * 0.99 else "🟢 At lower band" if cur_price <= cur_bbl * 1.01 else "⚪ Within bands",
@@ -453,8 +531,12 @@ def fetch_technical_data(symbol, period_window, calc_type):
             "Fibonacci Zone":  f"📐 Near {nearest_fib[0]} (${nearest_fib[1]:.2f}) — {'above' if fib_distance > 0 else 'below'} by {abs(fib_distance):.1f}%",
         }
 
-        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.50, 0.17, 0.17, 0.16], vertical_spacing=0.025,
-                            subplot_titles=[f"{symbol} — Price, {ma_label}, Bollinger Bands & Fibonacci", "Volume", "MACD  (12 / 26 / 9)", "RSI  (14-period)  |  70 = Overbought · 30 = Oversold"])
+        # Build chart
+        fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                            row_heights=[0.50, 0.17, 0.17, 0.16], vertical_spacing=0.025,
+                            subplot_titles=[f"{symbol} — Price, {ma_label}, Bollinger Bands & Fibonacci",
+                                            "Volume", "MACD  (12 / 26 / 9)",
+                                            "RSI  (14-period)  |  70 = Overbought · 30 = Oversold"])
         fig.add_trace(go.Scatter(x=hist.index, y=hist["BB_Upper"], showlegend=False, line=dict(color="rgba(120,120,255,0.35)", width=1)), row=1, col=1)
         fig.add_trace(go.Scatter(x=hist.index, y=hist["BB_Lower"], fill="tonexty", fillcolor="rgba(120,120,255,0.07)", showlegend=False, line=dict(color="rgba(120,120,255,0.35)", width=1)), row=1, col=1)
         fig.add_trace(go.Scatter(x=hist.index, y=hist["BB_Mid"], showlegend=False, line=dict(color="rgba(180,180,255,0.4)", width=1, dash="dot")), row=1, col=1)
@@ -475,8 +557,9 @@ def fetch_technical_data(symbol, period_window, calc_type):
         fig.add_trace(go.Scatter(x=hist.index, y=hist["RSI"], name="RSI", line=dict(color="#ce93d8", width=1.8)), row=4, col=1)
         for y_val, color in [(70, "rgba(244,67,54,0.55)"), (30, "rgba(76,175,80,0.55)")]:
             fig.add_hline(y=y_val, line_dash="dash", line_color=color, line_width=1.2, row=4, col=1)
-        fig.update_layout(template="plotly_dark", hovermode="x unified", height=820, margin=dict(l=10, r=80, t=40, b=10),
-                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,15,25,1)",
+        fig.update_layout(template="plotly_dark", hovermode="x unified", height=820,
+                          margin=dict(l=10, r=80, t=40, b=10), paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(15,15,25,1)",
                           legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1, font=dict(size=11)))
         fig.update_yaxes(title_text="Price ($)", row=1, col=1, gridcolor="#1e1e2e")
         fig.update_yaxes(title_text="Volume",   row=2, col=1, gridcolor="#1e1e2e")
@@ -509,10 +592,10 @@ Table: | Metric | Value | Plain-English Meaning |
 Current wave position, Fibonacci level as support/resistance, price targets up AND invalidation level.
 
 ## 🔀 Multi-Indicator Confluence
-Where indicators agree, where they conflict, overall signal strength (Strong/Moderate/Weak), one sentence a beginner can act on.
+Where indicators agree, where they conflict, overall signal strength (Strong/Moderate/Weak), one sentence a beginner can act on immediately.
 
 ## ⚠️ Risk Assessment
-Bull risk, bear risk, invalidation price, stop-loss zone (specific range).
+Bull risk, bear risk, invalidation price, stop-loss zone (specific price range).
 
 ## 🎯 Portfolio Strategy Suggestion
 **Bold:** action, entry zone, target zone, stop-loss, position size tier (aggressive/moderate/conservative). Risk/reward summary.
@@ -524,10 +607,8 @@ Bull risk, bear risk, invalidation price, stop-loss zone (specific range).
             return f"*Model: `{model}`*\n\n" + response.text
         except Exception as e: errors.append(f"**{model}:** {str(e)[:120]}")
     return ("### ⚠️ All Gemini models failed\n\n"
-            "**Most likely cause: API key issue in Streamlit Secrets.**\n\n"
             "1. [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) → Create fresh key\n"
-            "2. Streamlit app → Settings → Secrets → `GEMINI_API_KEY = \"your-key-here\"`\n"
-            "3. Save and wait ~30 seconds\n\n"
+            "2. Streamlit → Settings → Secrets → `GEMINI_API_KEY = \"your-key-here\"`\n\n"
             "**Errors:**\n" + "\n".join(f"- {e}" for e in errors))
 
 # ================================================================
@@ -562,7 +643,9 @@ def show_ai_report(report_key, symbol, metrics, period, method, fib_levels,
                    extra_context="", button_label="🤖  Generate AI Analyst Report"):
     if st.button(button_label, key=f"btn_{report_key}"):
         with st.spinner("Gemini is analysing — may take 20–40 seconds…"):
-            st.session_state[f"rpt_{report_key}"] = generate_ai_analysis(symbol, metrics, period, method, fib_levels, extra_context)
+            st.session_state[f"rpt_{report_key}"] = generate_ai_analysis(
+                symbol, metrics, period, method, fib_levels, extra_context
+            )
     stored = st.session_state.get(f"rpt_{report_key}")
     if stored:
         st.markdown("---"); st.markdown(stored)
@@ -574,7 +657,7 @@ def render_diversity_chart(rows, total_value):
     labels, values = [], []
     for row in rows:
         val = float(row.get("Mkt Value", "$0").replace("$", "").replace(",", ""))
-        if val > 0: labels.append(row["Asset"]); values.append(val)
+        if val > 0: labels.append(row["Display"]); values.append(val)
     if not values: return
     st.subheader("📊  Portfolio Diversity")
     n = len(values)
@@ -588,12 +671,16 @@ def render_diversity_chart(rows, total_value):
                           annotations=[dict(text=f"<b>${total_value:,.0f}</b>", x=0.5, y=0.5,
                                             font_size=15, showarrow=False, font=dict(color="#4fc3f7"))])
     else:
-        df_chart = pd.DataFrame({"Asset": labels, "Value": values, "Pct": [v / total_value * 100 for v in values]})
-        fig = go.Figure(go.Treemap(labels=df_chart["Asset"], parents=[""] * len(df_chart), values=df_chart["Value"],
-                                   texttemplate="<b>%{label}</b><br>%{customdata:.1f}%", customdata=df_chart["Pct"],
+        df_chart = pd.DataFrame({"Asset": labels, "Value": values,
+                                 "Pct": [v / total_value * 100 for v in values]})
+        fig = go.Figure(go.Treemap(labels=df_chart["Asset"], parents=[""] * len(df_chart),
+                                   values=df_chart["Value"],
+                                   texttemplate="<b>%{label}</b><br>%{customdata:.1f}%",
+                                   customdata=df_chart["Pct"],
                                    hovertemplate="<b>%{label}</b><br>$%{value:,.2f}<br>%{customdata:.1f}%<extra></extra>",
                                    marker=dict(colorscale="Blues", line=dict(width=2, color="#0f0f19"))))
-        fig.update_layout(template="plotly_dark", height=380, margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)")
+        fig.update_layout(template="plotly_dark", height=380,
+                          margin=dict(l=10, r=10, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig, use_container_width=True)
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -603,42 +690,32 @@ def get_openinsider_cluster_buys():
         dfs = pd.read_html(StringIO(r.text), flavor="lxml")
         if dfs:
             df = dfs[0]
-            col = next((c for c in df.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower()), df.columns[2] if len(df.columns) > 2 else None)
+            col = next((c for c in df.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower()),
+                       df.columns[2] if len(df.columns) > 2 else None)
             if col: return set(df[col].dropna().astype(str).str.upper().str.strip().tolist())
     except: pass
     return set()
 
 # ================================================================
-# PORTFOLIO EDIT TABLE
-# NEW: Inline editable data_editor with add/edit/delete support
+# PORTFOLIO EDIT TABLE  (clean — no toggles or warnings needed)
 # ================================================================
 def render_portfolio_editor(portfolio: dict, uid: str, pin: str):
-    """
-    Inline editable portfolio table.
-    - Edit: change Shares or Avg Cost directly in the cell
-    - Delete: remove a row to delete that position
-    - Add: type in a new row to add a position
-    Changes only apply when 'Save All Changes' is clicked.
-    """
     with st.expander("✏️  Edit / Delete / Add Positions", expanded=False):
         st.caption(
-            "**Edit** any cell · **Delete** a row (checkbox on left) to remove a position · "
-            "**Add a row** at the bottom to add a new position. "
-            "Crypto tickers must end in `-USD` (e.g. `ETH-USD`, `BTC-USD`). "
-            "Click **Save All Changes** when done — unsaved edits will be lost on page refresh."
+            "**Edit** shares or cost in any cell · "
+            "**Delete** a row (checkbox left) to remove · "
+            "**Add a row** at the bottom for a new position. "
+            "Just type the symbol — crypto is detected automatically. "
+            "Click **Save All Changes** when done."
         )
-
         edit_rows = [
-            {
-                "Ticker":           sym,
-                "Shares / Units":   float(pos["shares"]),
-                "Avg Cost ($)":     float(pos["cost"]),
-            }
+            {"Ticker": ticker_label(sym), "Full Ticker": sym,
+             "Shares / Units": float(pos["shares"]), "Avg Cost ($)": float(pos["cost"])}
             for sym, pos in portfolio.items()
         ]
         edit_df = (pd.DataFrame(edit_rows)
                    if edit_rows
-                   else pd.DataFrame(columns=["Ticker", "Shares / Units", "Avg Cost ($)"]))
+                   else pd.DataFrame(columns=["Ticker", "Full Ticker", "Shares / Units", "Avg Cost ($)"]))
 
         edited_df = st.data_editor(
             edit_df,
@@ -648,22 +725,22 @@ def render_portfolio_editor(portfolio: dict, uid: str, pin: str):
             column_config={
                 "Ticker": st.column_config.TextColumn(
                     "Ticker",
-                    help="Stock: AAPL, NVDA  |  Crypto: ETH-USD, BTC-USD, XRP-USD",
+                    help="Type any stock (AAPL) or crypto (ETH, BTC, XRP) symbol. "
+                         "Crypto -USD suffix is handled automatically.",
+                    width="small",
+                ),
+                "Full Ticker": st.column_config.TextColumn(
+                    "Full Ticker",
+                    help="Internal ticker used for data fetching",
+                    disabled=True,
                     width="small",
                 ),
                 "Shares / Units": st.column_config.NumberColumn(
-                    "Shares / Units",
-                    help="Supports up to 8 decimal places for crypto (e.g. 0.00250000 BTC)",
-                    min_value=0.0,
-                    format="%.8f",
-                    width="medium",
+                    "Shares / Units", min_value=0.0, format="%.8f", width="medium",
+                    help="Up to 8 decimal places (e.g. 0.00250000 BTC)",
                 ),
                 "Avg Cost ($)": st.column_config.NumberColumn(
-                    "Avg Cost ($)",
-                    help="Your average purchase price per share/unit",
-                    min_value=0.0,
-                    format="$%.2f",
-                    width="medium",
+                    "Avg Cost ($)", min_value=0.0, format="$%.2f", width="medium",
                 ),
             },
             key="portfolio_editor_table",
@@ -673,46 +750,27 @@ def render_portfolio_editor(portfolio: dict, uid: str, pin: str):
         with col_save:
             save_edits = st.button("💾  Save All Changes", use_container_width=True, key="save_all_edits")
         with col_hint:
-            st.caption("ℹ️  Deleting a row permanently removes it from cloud storage.")
+            st.caption("ℹ️  Changes apply only after clicking Save. Deleted rows are permanently removed.")
 
         if save_edits:
             new_portfolio = {}
-            crypto_warnings = []
-
             for _, row in edited_df.iterrows():
-                ticker = str(row.get("Ticker") or "").upper().strip()
+                # Prefer user-typed Ticker over Full Ticker for new rows
+                raw = str(row.get("Ticker") or row.get("Full Ticker") or "").strip()
+                ticker = normalize_ticker(raw)   # auto-appends -USD for crypto
                 shares = float(row.get("Shares / Units") or 0)
                 cost   = float(row.get("Avg Cost ($)") or 0)
-
-                if not ticker or shares == 0:
-                    continue
-
-                # Detect likely-crypto ticker missing -USD
-                if ticker in KNOWN_CRYPTO_SYMBOLS and not ticker.endswith("-USD"):
-                    crypto_warnings.append(ticker)
-
+                if not ticker or shares == 0: continue
                 new_portfolio[ticker] = {"shares": shares, "cost": cost}
 
             deleted = set(portfolio.keys()) - set(new_portfolio.keys())
-
-            # Sync to Supabase
             if SUPABASE_AVAILABLE:
                 for t, pos in new_portfolio.items():
                     save_position_to_db(uid, pin, t, pos["shares"], pos["cost"])
                 for t in deleted:
                     save_position_to_db(uid, pin, t, 0, 0)
-
             st.session_state["user_portfolio"] = new_portfolio
-
-            if crypto_warnings:
-                st.warning(
-                    f"⚠️ **Possible crypto ticker error:** "
-                    f"{', '.join(crypto_warnings)} saved but may be fetching a stock instead of crypto. "
-                    f"If you mean the cryptocurrency, change to {', '.join(t+'-USD' for t in crypto_warnings)}."
-                )
-            if deleted:
-                st.info(f"🗑️  Removed: {', '.join(deleted)}")
-
+            if deleted: st.info(f"🗑️  Removed: {', '.join(deleted)}")
             st.success(f"✅ Portfolio saved — {len(new_portfolio)} position(s)")
             st.rerun()
 
@@ -720,22 +778,34 @@ def render_portfolio_editor(portfolio: dict, uid: str, pin: str):
 # MAIN APP
 # ================================================================
 st.title("📊  Wall Street AI Dashboard")
-st.caption("Institutional-grade analysis · Gemini 2.5 Pro · Elliott Wave · Fibonacci · Insider Activity · Real-time data")
+st.caption("Institutional-grade analysis · Gemini 2.5 Pro · EMA / SMA / WMA · Elliott Wave · Fibonacci · Insider Activity")
 render_indicator_guide()
 st.divider()
 
 # ── Sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️  Analysis Settings")
-    ma_type = st.radio("Moving Average Type",
-                       ["Simple Moving Average (SMA)", "Weighted Moving Average (WMA)"],
-                       help="WMA reacts faster. SMA is smoother.")
-    sma_period = st.selectbox("Lookback Period", options=list(INTERVAL_MAP.keys()), index=1,
-                              format_func=lambda x: INTERVAL_MAP[x]["label"])
+
+    # EMA is now the first (default) option — the professional standard
+    ma_type = st.radio(
+        "Moving Average Type",
+        [
+            "Exponential Moving Average (EMA)",   # ← default, recommended
+            "Simple Moving Average (SMA)",
+            "Weighted Moving Average (WMA)",
+        ],
+        help=(
+            "EMA is the industry standard — reacts fast with minimal noise. "
+            "SMA is slower but excellent for long-term trend lines (200-day). "
+            "WMA is fastest but generates the most false signals."
+        )
+    )
+    sma_period = st.selectbox(
+        "Lookback Period", options=list(INTERVAL_MAP.keys()), index=1,
+        format_func=lambda x: INTERVAL_MAP[x]["label"],
+    )
     st.divider()
 
-    # FIX: Use explicit if/else blocks — ternary expressions cause
-    # DeltaGenerator repr to render in sidebar on some Streamlit versions
     if not AI_AVAILABLE:
         st.error("⚠️ GEMINI_API_KEY missing — AI disabled.")
     elif len(GEMINI_API_KEY) < 20:
@@ -788,25 +858,29 @@ if mode == "💼  My Portfolio":
                     st.rerun()
         st.stop()
 
-    # ── Sidebar: add new position (quick-add form) ────────────────
+    # ── Sidebar: Quick-add (no toggle — crypto auto-detected) ─────
     with st.sidebar:
         st.subheader("🛠️  Quick Add Position")
         if SUPABASE_AVAILABLE:
             st.caption(f"Logged in as: **{st.session_state.get('auth_user','—')}**")
 
         with st.form("position_form"):
-            asset_type = st.radio("Asset Type", ["📈 Stock", "₿ Crypto"], horizontal=True,
-                                  help="Crypto auto-appends -USD")
-            raw_ticker = st.text_input("Ticker Symbol",
-                                       placeholder="Stock: AAPL  |  Crypto: ETH or ETH-USD").upper().strip()
-            new_shares = st.number_input("Shares / Units", min_value=0.0, step=0.00000001, format="%.8f",
-                                         help="Supports 8 decimal places for crypto")
-            new_cost   = st.number_input("Avg Purchase Price ($)", min_value=0.0, step=0.01)
-            save_btn   = st.form_submit_button("➕  Add Position", use_container_width=True)
+            raw_ticker = st.text_input(
+                "Ticker Symbol",
+                placeholder="AAPL · NVDA · ETH · BTC · XRP · SOL",
+                help="Just type the symbol. Crypto is detected automatically — no suffix needed.",
+            ).strip()
+            new_shares = st.number_input(
+                "Shares / Units", min_value=0.0, step=0.00000001, format="%.8f",
+                help="Supports 8 decimal places for crypto (e.g. 0.00250000 BTC)"
+            )
+            new_cost = st.number_input("Avg Purchase Price ($)", min_value=0.0, step=0.01)
+            save_btn = st.form_submit_button("➕  Add Position", use_container_width=True)
 
         if save_btn and raw_ticker:
-            new_ticker = (raw_ticker if raw_ticker.endswith("-USD") else raw_ticker + "-USD") if "Crypto" in asset_type else raw_ticker
-            uid = st.session_state.get("auth_user", "local"); pin = st.session_state.get("auth_pin", "")
+            new_ticker = normalize_ticker(raw_ticker)   # auto-handles crypto
+            uid = st.session_state.get("auth_user", "local")
+            pin = st.session_state.get("auth_pin", "")
             if new_shares == 0:
                 st.session_state["user_portfolio"].pop(new_ticker, None)
                 if SUPABASE_AVAILABLE: save_position_to_db(uid, pin, new_ticker, 0, 0)
@@ -838,33 +912,23 @@ if mode == "💼  My Portfolio":
     pin = st.session_state.get("auth_pin", "")
 
     if not portfolio:
-        st.info("Portfolio is empty. Use **Quick Add Position** in the sidebar, or use the **Edit / Delete / Add Positions** expander below.")
-        # Show empty editor so user can add positions directly
+        st.info("Portfolio is empty. Use **Quick Add** in the sidebar or the edit table below.")
         render_portfolio_editor({}, uid, pin)
     else:
-        # Crypto ticker warning — detect ETH saved without -USD
-        wrong_crypto = [s for s in portfolio.keys() if s.upper() in KNOWN_CRYPTO_SYMBOLS and not s.endswith("-USD")]
-        if wrong_crypto:
-            st.warning(
-                f"⚠️ **Possible crypto ticker error:** **{', '.join(wrong_crypto)}** "
-                f"{'looks' if len(wrong_crypto) == 1 else 'look'} like "
-                f"{'a cryptocurrency' if len(wrong_crypto) == 1 else 'cryptocurrencies'} "
-                f"but {'is' if len(wrong_crypto) == 1 else 'are'} missing the `-USD` suffix. "
-                f"Use **Edit / Delete / Add Positions** below to fix: change "
-                f"**{' / '.join(wrong_crypto)}** → **{' / '.join(s+'-USD' for s in wrong_crypto)}**."
-            )
-
         total_value = total_cost = 0.0; rows, charts = [], {}
+
         with st.spinner("Fetching live data (5-min cache active)…"):
             for sym, pos in list(portfolio.items()):
                 _, metrics, fig, price, fib = fetch_technical_data(sym, sma_period, ma_type)
                 if price > 0:
                     pos_cost = pos["shares"] * pos["cost"]; pos_value = pos["shares"] * price
-                    pos_gain = pos_value - pos_cost; pos_pct = (pos_gain / pos_cost * 100) if pos_cost > 0 else 0.0
+                    pos_gain = pos_value - pos_cost
+                    pos_pct  = (pos_gain / pos_cost * 100) if pos_cost > 0 else 0.0
                     total_value += pos_value; total_cost += pos_cost
                     if fig: charts[sym] = (fig, fib, metrics)
                     rows.append({
-                        "Asset":         sym,
+                        "Display":       ticker_label(sym),   # clean name (ETH not ETH-USD)
+                        "Asset":         sym,                  # full ticker for lookups
                         "Shares":        f"{pos['shares']:.8f}".rstrip("0").rstrip("."),
                         "Avg Cost":      f"${pos['cost']:.2f}",
                         "Current Price": f"${price:.2f}",
@@ -885,25 +949,36 @@ if mode == "💼  My Portfolio":
         k4.metric("Open Positions",        str(len(rows)))
 
         st.subheader("Holdings Summary")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        # Show friendly names (ETH, BTC) but keep Asset col for internal use
+        display_cols = ["Display", "Shares", "Avg Cost", "Current Price",
+                        "Mkt Value", "Return ($)", "Return (%)", "MA Signal", "RSI", "Fibonacci"]
+        st.dataframe(
+            pd.DataFrame(rows)[display_cols].rename(columns={"Display": "Asset"}),
+            use_container_width=True, hide_index=True
+        )
 
-        # NEW: Inline editable portfolio table
         render_portfolio_editor(portfolio, uid, pin)
-
         render_diversity_chart(rows, total_value)
 
         st.subheader("📈  Deep-Dive Chart & AI Analysis")
-        chosen = st.selectbox("Select a holding", list(portfolio.keys()))
+        # Dropdown shows clean names, maps back to full tickers
+        sym_options = {ticker_label(sym): sym for sym in portfolio.keys()}
+        chosen_label = st.selectbox("Select a holding", list(sym_options.keys()))
+        chosen = sym_options[chosen_label]
+
         if chosen in charts:
             fig, fib, chosen_metrics = charts[chosen]
             st.plotly_chart(fig, use_container_width=True)
             if not chosen.endswith("-USD"): render_insider_section(chosen)
             pos_detail = portfolio.get(chosen, {})
             ins_df  = get_insider_transactions(chosen) if not chosen.endswith("-USD") else None
-            context = (f"Held: {pos_detail.get('shares',0):.8f} units at ${pos_detail.get('cost',0):.2f} avg. "
-                       f"P&L: {next((r['Return (%)'] for r in rows if r['Asset']==chosen),'unknown')}. "
+            pnl_row = next((r for r in rows if r["Asset"] == chosen), {})
+            context = (f"Held: {pos_detail.get('shares',0):.8f} units at "
+                       f"${pos_detail.get('cost',0):.2f} avg. "
+                       f"P&L: {pnl_row.get('Return (%)', 'unknown')}. "
                        f"{insider_summary(ins_df)}")
-            show_ai_report(f"portfolio_{chosen}", chosen, chosen_metrics, sma_period, ma_type, fib, extra_context=context)
+            show_ai_report(f"portfolio_{chosen}", chosen, chosen_metrics,
+                           sma_period, ma_type, fib, extra_context=context)
         else:
             st.warning("Chart unavailable for this asset.")
 
@@ -912,31 +987,34 @@ if mode == "💼  My Portfolio":
 # ================================================================
 elif mode == "🔍  Analyze Single Asset":
     st.header("🔍  Single Asset Analysis")
-    st.caption("Any US stock or crypto. **Crypto format:** BTC-USD, ETH-USD, XRP-USD, SOL-USD")
+    st.caption("Any US stock or crypto — type the symbol, crypto is detected automatically.")
 
     c1, c2 = st.columns([4, 1])
     with c1:
-        symbol_input = st.text_input("Ticker", label_visibility="collapsed",
-                                     placeholder="Stock: NVDA, AAPL   |   Crypto: BTC-USD, ETH-USD").upper().strip()
+        raw_input = st.text_input("Ticker", label_visibility="collapsed",
+                                  placeholder="NVDA · AAPL · ETH · BTC-USD · XRP · SOL").strip()
     with c2:
         st.markdown("<br>", unsafe_allow_html=True)
         go_btn = st.button("Analyse →", use_container_width=True)
 
-    if go_btn and symbol_input:
+    if go_btn and raw_input:
+        symbol_input = normalize_ticker(raw_input)
         with st.spinner(f"Fetching {symbol_input}…"):
             result = fetch_technical_data(symbol_input, sma_period, ma_type)
         if result[3] == 0.0:
-            st.error(f"No data for **{symbol_input}**. Crypto needs format BTC-USD, ETH-USD etc.")
+            st.error(f"No data for **{symbol_input}**. Check the ticker and try again.")
         else:
             st.session_state["single_result"] = (symbol_input, result, sma_period, ma_type)
-            for k in [k for k in st.session_state if k.startswith(("rpt_single_", "insider_ai_")) and symbol_input not in k]:
+            for k in [k for k in st.session_state
+                      if k.startswith(("rpt_single_", "insider_ai_")) and symbol_input not in k]:
                 del st.session_state[k]
 
     if "single_result" in st.session_state:
         sym, (_, metrics, fig, price, fib), period, method = st.session_state["single_result"]
         if st.button("🔄  Analyse a different ticker", key="clear_single"):
             del st.session_state["single_result"]
-            for k in [k for k in st.session_state if k.startswith(("rpt_single_", "insider_ai_", "btn_single", "clr_single"))]:
+            for k in [k for k in st.session_state
+                      if k.startswith(("rpt_single_", "insider_ai_", "btn_single", "clr_single"))]:
                 st.session_state.pop(k, None)
             st.rerun()
         st.markdown(f"**Showing: `{sym}`** — {INTERVAL_MAP.get(period, {}).get('label','')}")
