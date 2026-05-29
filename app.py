@@ -1,5 +1,21 @@
 # ================================================================
-# WALL STREET AI DASHBOARD — Production Build v2.9
+# WALL STREET AI DASHBOARD — Production Build v2.11
+# v2.11 patches (incremental on v2.10):
+#   NEW: OpenInsider is now the PRIMARY insider data source (per-ticker)
+#        — scrapes SEC Form 4 directly, more reliable than yfinance
+#   NEW: get_insider_data() unified helper (OpenInsider → yfinance fallback)
+#   FIX: Elliott Wave AI prompt overhauled — rigorous 9-wave framework,
+#        confidence levels, alternative scenarios, eliminates "always W3" bias
+# ================================================================
+# Previous (v2.10):
+# v2.10 patches (incremental on v2.9):
+#   FIX: Scanner dropdown no longer clears results — scan persisted to session_state
+#   FIX: Insider transactions hardened — defensive column detection, retry, fallback
+#   NEW: get_insider_summary_fallback() uses yfinance insider_purchases endpoint
+#        as backstop when the detailed table is empty
+#   NEW: "Clear Scan" button + cached-scan timestamp + settings-drift warning
+# ================================================================
+# Previous (v2.9):
 # NEW:   Fresh-vs-stale crossover scoring (3/2/1/0 pts by bars since signal)
 # NEW:   Portfolio notifications filtered to last 5 trading days, compact UI
 # NEW:   Batch yfinance fetching for scanner (5–10x speedup)
@@ -470,25 +486,74 @@ def _categorize_tx(text):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_insider_transactions(symbol):
+    """
+    Hardened insider-transaction fetch.
+    - Defensive column detection (yfinance changes names between versions)
+    - Distinguishes 'no data' from 'data exists but filtered out'
+    - Always returns DataFrame or None (never raises)
+    """
     try:
-        raw = yf.Ticker(symbol).insider_transactions
-        if raw is None or raw.empty: return None
+        ticker_obj = yf.Ticker(symbol)
+        # Brief retry for transient yfinance hiccups
+        raw = None
+        for attempt in range(2):
+            try:
+                raw = ticker_obj.insider_transactions
+                if raw is not None and not raw.empty:
+                    break
+            except Exception:
+                if attempt == 0: time.sleep(0.3)
+
+        if raw is None or raw.empty:
+            return None
+
         df = raw.copy()
-        date_col = next((c for c in df.columns if "date" in c.lower()), None)
+
+        # Date column — try known names first, then any 'date'-like column
+        date_col = None
+        for cand in ["Start Date", "Date", "TransactionDate", "Transaction Date"]:
+            if cand in df.columns:
+                date_col = cand; break
+        if not date_col:
+            date_col = next((c for c in df.columns if "date" in str(c).lower()), None)
+
         if date_col:
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
             cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=365)
-            df = df[df[date_col] >= cutoff]
+            df_filtered = df[df[date_col] >= cutoff].copy()
+            if df_filtered.empty and not df.empty:
+                # All filings older than 12mo — return None; caller shows helpful message
+                return None
+            df = df_filtered
             df["Date"] = df[date_col].dt.strftime("%m/%d/%Y")
-        text_col = next((c for c in df.columns if c.lower() in ["text","description","transaction"]), None)
-        df["Transaction Type"] = df[text_col].apply(_categorize_tx) if text_col else "⚪ Unknown"
+
+        # Description column — most discriminating for transaction type
+        text_col = None
+        for cand in ["Text", "Description", "Transaction", "transaction_text"]:
+            if cand in df.columns:
+                text_col = cand; break
+        if not text_col:
+            text_col = next(
+                (c for c in df.columns if str(c).lower() in ["text","description","transaction"]),
+                None
+            )
+
+        if text_col:
+            df["Transaction Type"] = df[text_col].apply(_categorize_tx)
+        else:
+            df["Transaction Type"] = "⚪ Unknown"
+
         def _find(patterns):
             for p in patterns:
-                col = next((c for c in df.columns if p in c.lower()), None)
+                col = next((c for c in df.columns if p in str(c).lower()), None)
                 if col: return col
             return None
-        name_col = _find(["insider","name"]); pos_col = _find(["position","title","role"])
-        share_col = _find(["share"]); val_col = _find(["value"])
+
+        name_col  = _find(["insider","name"])
+        pos_col   = _find(["position","title","role"])
+        share_col = _find(["share"])
+        val_col   = _find(["value"])
+
         clean = pd.DataFrame()
         if "Date" in df.columns:  clean["Date"]    = df["Date"]
         if name_col:              clean["Insider"]  = df[name_col]
@@ -502,9 +567,67 @@ def get_insider_transactions(symbol):
             vals = pd.to_numeric(df[val_col], errors="coerce")
             clean["Est. Value ($)"] = vals.apply(lambda x: f"${x:,.0f}" if pd.notna(x) and x > 0 else "—")
             clean["_raw_value"] = vals
-        if text_col: clean["Description"] = df[text_col]
+        if text_col:
+            clean["Description"] = df[text_col]
+
         return clean if not clean.empty else None
-    except: return None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_insider_summary_fallback(symbol):
+    """
+    Fallback when detailed insider_transactions returns nothing.
+    yfinance also exposes insider_purchases — a small summary table of
+    net purchases over 3/6/12 months. Often works when the full table fails.
+    Returns a markdown-ready string or None.
+    """
+    try:
+        purchases = yf.Ticker(symbol).insider_purchases
+        if purchases is None or purchases.empty:
+            return None
+        df = purchases.copy()
+        # Try to find a row labelled with "Net" insider activity
+        net_val = None
+        first_col = df.columns[0] if len(df.columns) > 0 else None
+        if first_col is not None:
+            for label_pattern in ["Net Shares Purchased", "Net Insider", "Net Activity"]:
+                matches = df[df[first_col].astype(str).str.contains(label_pattern, case=False, na=False)]
+                if not matches.empty:
+                    # Scan remaining columns for the first numeric value
+                    for vc in df.columns[1:]:
+                        try:
+                            val = pd.to_numeric(matches[vc].iloc[0], errors="coerce")
+                            if pd.notna(val):
+                                net_val = int(val); break
+                        except Exception: continue
+                    if net_val is not None: break
+
+        if net_val is None:
+            # Couldn't parse a specific number — show the raw summary
+            return f"_yfinance summary endpoint returned data but in an unrecognized format:_\n\n```\n{df.to_string(index=False)[:500]}\n```"
+
+        if net_val > 0:
+            return f"🟢 **Net insider buying:** {net_val:,} shares purchased on net (yfinance 6-month summary)."
+        elif net_val < 0:
+            return f"🔴 **Net insider selling:** {abs(net_val):,} shares sold on net (yfinance 6-month summary)."
+        else:
+            return "⚪ Net insider activity is zero over the recent summary period."
+    except Exception:
+        return None
+
+def get_insider_data(symbol):
+    """
+    Unified insider data getter — tries OpenInsider first, yfinance second.
+    This is the recommended entry point for AI context / summary calls.
+    Defined as a regular function (not cached) so it composes cached calls.
+    """
+    if not symbol or symbol.endswith("-USD"):
+        return None
+    df = get_openinsider_per_ticker(symbol)
+    if df is None or df.empty:
+        df = get_insider_transactions(symbol)
+    return df
 
 def insider_summary(df):
     if df is None: return "No insider transaction data available."
@@ -546,11 +669,25 @@ Respond in plain markdown. Do not use nested asterisks or malformed bold markers
 def render_insider_section(symbol):
     with st.expander("👔  Insider & Executive Transactions (last 12 months)", expanded=False):
         with st.spinner("Loading SEC Form 4 data…"):
-            df = get_insider_transactions(symbol)
+            # Try OpenInsider first — scrapes SEC Form 4 directly, most reliable
+            df = get_openinsider_per_ticker(symbol)
+            data_source = "OpenInsider (SEC Form 4 direct)"
+            # Fall back to yfinance only if OpenInsider returns nothing
+            if df is None:
+                df = get_insider_transactions(symbol)
+                data_source = "yfinance (fallback)"
         if df is None:
-            st.info("No recent insider data found."); return
-        st.caption("Source: SEC Form 4 via Yahoo Finance. Open Market = personal cash = genuine conviction.")
-        show_noise = st.toggle("Show Non-Market entries", value=False, key=f"noise_{symbol}")
+            # Last resort: try yfinance's lightweight insider_purchases summary
+            fallback = get_insider_summary_fallback(symbol)
+            if fallback:
+                st.info(fallback)
+                st.caption("Detailed transaction-level data unavailable from either OpenInsider or yfinance — showing yfinance summary only.")
+            else:
+                st.info("No recent insider data found. Neither OpenInsider nor yfinance returned transactions for this ticker in the last 12 months.")
+            return
+        st.caption(f"Source: **{data_source}**. Open Market = personal cash = genuine conviction.")
+        show_noise = st.toggle("Show Non-Market entries (awards, exercises, gifts)",
+                                value=False, key=f"noise_{symbol}")
         display_df = df if show_noise else df[df["Transaction Type"] != "⚪ Non-Market"]
         display_df = display_df[[c for c in display_df.columns if c != "_raw_value"]]
         if display_df.empty:
@@ -579,7 +716,6 @@ def render_insider_section(symbol):
                 st.session_state[ai_key] = generate_insider_ai_analysis(symbol, df)
         if ai_key in st.session_state:
             st.markdown("---")
-            # FIX: sanitize $ signs to prevent LaTeX rendering
             st.markdown(_sanitize_ai_markdown(st.session_state[ai_key]))
             if st.button("🗑️  Clear", key=f"clr_{ai_key}"):
                 del st.session_state[ai_key]; st.rerun()
@@ -614,6 +750,141 @@ def get_openinsider_cluster_buys():
                         return tickers
         except: continue
     return set()
+
+# ----------------------------------------------------------------
+# OpenInsider per-ticker: primary insider data source
+# Scrapes SEC Form 4 filings directly. More reliable than yfinance.
+# Transaction codes:  P = Purchase  S = Sale  A = Award  M = Exercise
+#                     G = Gift      F = Tax   D = Sale to Issuer
+# ----------------------------------------------------------------
+def _map_openinsider_trade_type(raw):
+    """Convert OpenInsider trade type string to our standard categories."""
+    t = str(raw).strip().lower()
+    # Sales involving option exercise are noise (not a discretionary signal)
+    if "+oe" in t or "option" in t and "exercise" in t:
+        return "⚪ Non-Market"
+    # Standard purchase
+    if t.startswith("p ") or t.startswith("p-") or "purchase" in t:
+        return "🟢 Open Market Buy"
+    # Standard sale
+    if t.startswith("s ") or t.startswith("s-") or (t.startswith("sale") and "oe" not in t):
+        return "🔴 Open Market Sale"
+    # Non-market actions
+    if any(k in t for k in ("award","grant","stock award","compensation")):
+        return "⚪ Non-Market"
+    if t.startswith("a ") or t.startswith("a-"):  return "⚪ Non-Market"
+    if t.startswith("m ") or t.startswith("m-") or "exercise" in t: return "⚪ Non-Market"
+    if t.startswith("g ") or t.startswith("g-") or "gift" in t:     return "⚪ Non-Market"
+    if t.startswith("f ") or t.startswith("f-") or "tax" in t:      return "⚪ Non-Market"
+    if t.startswith("d ") or "sale to issuer" in t:                 return "⚪ Non-Market"
+    return "⚪ Other"
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_openinsider_per_ticker(symbol):
+    """
+    Fetch per-ticker insider transactions from OpenInsider (last 365 days).
+    Returns a cleaned DataFrame matching the same column schema as
+    get_insider_transactions() for drop-in compatibility, or None if no data.
+    """
+    if not symbol or symbol.endswith("-USD"):
+        return None
+    url = (
+        f"https://openinsider.com/screener?s={symbol.upper()}"
+        "&o=&pl=&ph=&ll=&lh=&fd=365&fdr=&td=0&tdr=&fdlyl=&fdlyh=&daysago=&xp="
+        "&vl=&vh=&ocl=&och=&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil=&nih="
+        "&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=100&page=1"
+    )
+    try:
+        for attempt in range(2):
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=15)
+                if r.status_code == 200: break
+            except Exception:
+                if attempt == 0: time.sleep(0.4)
+        else:
+            return None
+        if r.status_code != 200: return None
+
+        dfs = pd.read_html(StringIO(r.text), flavor="lxml")
+        if not dfs: return None
+
+        # Find the transaction table — has Insider + Trade Type columns
+        target = None
+        for df in dfs:
+            cols_l = [str(c).strip().lower() for c in df.columns]
+            has_insider = any("insider" in c or "name" in c for c in cols_l)
+            has_type    = any("trade type" in c or "tradetype" in c or "type" == c for c in cols_l)
+            if has_insider and has_type and len(df) > 0:
+                target = df; break
+
+        if target is None or target.empty:
+            return None
+
+        df = target.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+
+        def _col(patterns):
+            for p in patterns:
+                for c in df.columns:
+                    if p in c.lower(): return c
+            return None
+
+        date_col  = _col(["filing date", "trade date", "date"])
+        name_col  = _col(["insider name", "insider", "name"])
+        title_col = _col(["title", "role", "position"])
+        type_col  = _col(["trade type", "tradetype"])
+        qty_col   = _col(["qty", "shares", "quantity"])
+        price_col = _col(["price"])
+        value_col = _col(["value"])
+
+        clean = pd.DataFrame()
+
+        if date_col:
+            dt = pd.to_datetime(df[date_col], errors="coerce")
+            clean["Date"] = dt.dt.strftime("%m/%d/%Y")
+        if name_col:
+            clean["Insider"] = df[name_col].astype(str).str.strip()
+        if title_col:
+            clean["Role"] = df[title_col].astype(str).str.strip()
+
+        if type_col:
+            clean["Transaction Type"] = df[type_col].apply(_map_openinsider_trade_type)
+        else:
+            clean["Transaction Type"] = "⚪ Unknown"
+
+        if qty_col:
+            qty_num = pd.to_numeric(
+                df[qty_col].astype(str).str.replace(",","").str.replace("+","").str.replace("$",""),
+                errors="coerce"
+            )
+            clean["Shares"] = qty_num.abs().apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else "—"
+            )
+
+        if value_col:
+            val_num = pd.to_numeric(
+                df[value_col].astype(str).str.replace(",","").str.replace("+","").str.replace("$",""),
+                errors="coerce"
+            )
+            clean["Est. Value ($)"] = val_num.abs().apply(
+                lambda x: f"${x:,.0f}" if pd.notna(x) and x > 0 else "—"
+            )
+            clean["_raw_value"] = val_num.abs()
+
+        # Build a Description column for AI context
+        if type_col and price_col:
+            try:
+                clean["Description"] = (
+                    df[type_col].astype(str) + " @ $" + df[price_col].astype(str)
+                ).str.strip()
+            except Exception:
+                clean["Description"] = df[type_col].astype(str)
+        elif type_col:
+            clean["Description"] = df[type_col].astype(str)
+
+        return clean if not clean.empty else None
+    except Exception:
+        return None
 
 # ================================================================
 # PERFORMANCE CACHE — retry-with-backoff, longer TTL
@@ -907,12 +1178,45 @@ Framework: {period}-day {method}
 EXACTLY five sections:
 ## Quantitative Tear Sheet
 Table: | Metric | Value | Plain-English Meaning |
+
 ## Elliott Wave & Trend Structure
-Wave position, Fibonacci support/resistance, price targets AND invalidation level.
+
+**IMPORTANT — Apply Elliott Wave theory rigorously. DO NOT default to "wave 3 impulse"
+just because the stock is in an uptrend. Wave 3 is the EASIEST wave to mis-call.**
+
+Identify the current wave position using these specific markers:
+
+| Wave | Tell-tale Markers |
+|------|------------------|
+| **Wave 1** (new impulse) | Just emerging from base/consolidation; modest volume; no prior clear structure; often goes unnoticed |
+| **Wave 2** (pullback) | Sharp 50–78.6% retracement of W1; sentiment fearful again; volume dries up |
+| **Wave 3** (strongest) | REQUIRES clear W1-W2 setup before this; HIGHEST volume; price gaps and breaks decisively above W1 high; momentum/RSI peaking |
+| **Wave 4** (consolidation) | Shallow 23.6–38.2% pullback from W3 peak; sideways triangle or flat; RSI cools to 40-55 |
+| **Wave 5** (final push) | Extended rally; RSI/MACD shows NEGATIVE DIVERGENCE (lower momentum highs vs higher price highs); volume often lower than W3 |
+| **Wave A** (correction start) | Sharp decline from W5 peak |
+| **Wave B** (counter-rally) | Partial recovery, 50–78.6% of A; often deceptive ("dead cat bounce") |
+| **Wave C** (final decline) | Second-leg drop, often equal in length to wave A |
+| **Uncertain** | Acknowledge when data is insufficient or the pattern is ambiguous — this is a legitimate answer |
+
+Specifically reference the provided data:
+- **Volume vs 20-avg** → distinguishes W3 (high volume) from W5 (lower volume)
+- **RSI level + Signal Age** → fresh signal at RSI 40-55 suggests W1 or W3 start; extended rally with RSI >70 + old signal suggests W5
+- **Fibonacci Zone proximity** → "above 23.6%" after a rally = possible W4; "above 50/61.8%" after decline = possible Wave B
+- **1-Mo Momentum** → very strong (>10%) suggests W3 in progress; modest with extended history suggests W5
+
+Then provide:
+1. **Most likely wave count** with explicit reasoning citing the markers above
+2. **Confidence level**: High / Moderate / Low — be honest about uncertainty
+3. **Alternative wave count** if the primary is not high-confidence (e.g., "Could also be early W5 if volume divergence confirms")
+4. **Specific Fibonacci-based price targets** (W3 = 1.618×W1, W5 = 1.0×W1 measured from W4 low, etc.)
+5. **Clear invalidation level** — the exact price at which your wave count would be wrong
+
 ## Multi-Indicator Confluence
 Where indicators agree/conflict, signal strength justification, one actionable sentence for beginners.
+
 ## Risk Assessment
 Bull risk, bear risk, invalidation price, stop-loss zone (specific price range).
+
 ## Portfolio Strategy Suggestion
 **Action:** (buy/hold/sell/avoid). Entry zone, target, stop-loss, position size tier. Risk/reward summary.
 """
@@ -1394,7 +1698,7 @@ if mode == "💼  My Portfolio":
                 render_signal_breakdown(chosen_metrics.get("_breakdown", {}) if isinstance(chosen_metrics, dict) else {})
                 if not chosen.endswith("-USD"): render_insider_section(chosen)
                 pos_detail = portfolio.get(chosen,{})
-                ins_df = get_insider_transactions(chosen) if not chosen.endswith("-USD") else None
+                ins_df = get_insider_data(chosen) if not chosen.endswith("-USD") else None
                 pnl_row = next((r for r in rows if r["Asset"]==chosen),{})
                 context = (f"Held: {pos_detail.get('shares',0):.8f} units at "
                            f"${pos_detail.get('cost',0):.2f} avg. "
@@ -1436,7 +1740,7 @@ elif mode == "🔍  Analyze Single Asset":
         render_signal_breakdown(metrics.get("_breakdown",{}))
         st.plotly_chart(fig, use_container_width=True)
         if not sym.endswith("-USD"): render_insider_section(sym)
-        ins_df = get_insider_transactions(sym) if not sym.endswith("-USD") else None
+        ins_df = get_insider_data(sym) if not sym.endswith("-USD") else None
         show_ai_report(f"single_{sym}", sym, metrics, period, method, fib,
                        extra_context=insider_summary(ins_df),
                        button_label="🤖  Generate Full AI Report")
@@ -1515,45 +1819,94 @@ elif mode == "🌐  Market Scanner":
                 else:
                     st.info(f"Scanning **{len(tickers)}** tickers for confluence score ≥ **{min_score}/14**…")
                     results, figs = scan_tickers(tickers, sma_period, ma_type, min_score=min_score)
+                    # ── Persist scan to session state so dropdown changes
+                    #    don't clear the results on rerun
+                    st.session_state["scanner_state"] = {
+                        "results":   results,
+                        "figs":      figs,
+                        "universe":  universe,
+                        "period":    sma_period,
+                        "method":    ma_type,
+                        "threshold": min_score,
+                        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+                    }
 
-                    if results:
-                        exc_ct  = sum(1 for r in results if "Exceptional" in r.get("Signal Strength",""))
-                        str_ct  = sum(1 for r in results if "Strong Buy"  in r.get("Signal Strength","") and "Exceptional" not in r.get("Signal Strength",""))
-                        mod_ct  = sum(1 for r in results if "Moderate"    in r.get("Signal Strength",""))
-                        fresh_count = sum(
-                            1 for r in results
-                            if r.get("Signal Age","") == "today" or
-                               any(r.get("Signal Age","").startswith(f"{n}d") for n in range(0,6))
-                        )
-                        st.success(f"✅ **{len(results)}** setups found · **{fresh_count}** with fresh crossover signals (≤5d)")
-                        s1,s2,s3,s4 = st.columns(4)
-                        s1.metric("🔥 Exceptional", exc_ct)
-                        s2.metric("🟢 Strong Buy",  str_ct)
-                        s3.metric("🟡 Moderate Buy", mod_ct)
-                        s4.metric("⚡ Fresh (≤5d)", fresh_count)
+        # ── Display from session state (survives reruns triggered by dropdown) ──
+        scanner_state = st.session_state.get("scanner_state")
+        if scanner_state:
+            results = scanner_state["results"]
+            figs    = scanner_state["figs"]
+            cached_univ   = scanner_state.get("universe", "?")
+            cached_period = scanner_state.get("period", "?")
+            cached_method = scanner_state.get("method", "?")
+            cached_thresh = scanner_state.get("threshold", "?")
+            cached_time   = scanner_state.get("timestamp", "?")
 
-                        df_r = pd.DataFrame(results)
-                        scan_display = [c for c in ["Ticker","Signal Strength","Signal Age","Price","1-Mo Momentum",
-                                                     "MA Signal","RSI (Wilder)","MACD","Fibonacci Zone"] if c in df_r.columns]
-                        st.dataframe(df_r[scan_display], use_container_width=True, hide_index=True)
+            # Notice if current sidebar settings differ from cached scan
+            settings_drifted = (
+                cached_period != sma_period or
+                cached_method != ma_type or
+                cached_thresh != min_score
+            )
+            label_col, clear_col = st.columns([5,1])
+            with label_col:
+                if settings_drifted:
+                    st.warning(
+                        f"⚠️ Showing cached scan from **{cached_time}** "
+                        f"({cached_method[:3]} · {cached_period}d · ≥{cached_thresh}/14). "
+                        f"Sidebar settings have changed — click **Launch Scan** to refresh."
+                    )
+                else:
+                    st.caption(
+                        f"📋 Last scan: **{cached_time}** · "
+                        f"{cached_method[:3]} · {cached_period}d · ≥{cached_thresh}/14"
+                    )
+            with clear_col:
+                if st.button("🗑️ Clear", key="clear_scan", use_container_width=True):
+                    del st.session_state["scanner_state"]
+                    # Also clear any per-scanner AI reports
+                    for k in [k for k in list(st.session_state.keys()) if k.startswith(("rpt_scanner_","btn_scanner_","clr_scanner_"))]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
 
-                        st.subheader("📊  Deep-Dive Chart")
-                        triggered = [r["Ticker"] for r in results]
-                        view_sym  = st.selectbox("Select a ticker (sorted by score)", triggered)
+            if results:
+                exc_ct  = sum(1 for r in results if "Exceptional" in r.get("Signal Strength",""))
+                str_ct  = sum(1 for r in results if "Strong Buy"  in r.get("Signal Strength","") and "Exceptional" not in r.get("Signal Strength",""))
+                mod_ct  = sum(1 for r in results if "Moderate"    in r.get("Signal Strength",""))
+                fresh_count = sum(
+                    1 for r in results
+                    if r.get("Signal Age","") == "today" or
+                       any(r.get("Signal Age","").startswith(f"{n}d") for n in range(0,6))
+                )
+                st.success(f"✅ **{len(results)}** setups found · **{fresh_count}** with fresh crossover signals (≤5d)")
+                s1,s2,s3,s4 = st.columns(4)
+                s1.metric("🔥 Exceptional", exc_ct)
+                s2.metric("🟢 Strong Buy",  str_ct)
+                s3.metric("🟡 Moderate Buy", mod_ct)
+                s4.metric("⚡ Fresh (≤5d)", fresh_count)
 
-                        if view_sym in figs:
-                            fig, fib, breakdown = _unpack_chart_entry(figs[view_sym])
-                            if fig: st.plotly_chart(fig, use_container_width=True)
-                            render_signal_breakdown(breakdown)
-                            if not view_sym.endswith("-USD"): render_insider_section(view_sym)
-                            stock_metrics = next((r for r in results if r["Ticker"]==view_sym),{})
-                            ins_df = get_insider_transactions(view_sym) if not view_sym.endswith("-USD") else None
-                            show_ai_report(f"scanner_{view_sym}", view_sym, stock_metrics,
-                                           sma_period, ma_type, fib,
-                                           extra_context=insider_summary(ins_df),
-                                           button_label="🤖  AI Analysis for this stock")
-                    else:
-                        st.warning(f"No stocks scored ≥{min_score}/14 with current settings. Try lowering the threshold, switching to EMA, or a shorter lookback period.")
+                df_r = pd.DataFrame(results)
+                scan_display = [c for c in ["Ticker","Signal Strength","Signal Age","Price","1-Mo Momentum",
+                                             "MA Signal","RSI (Wilder)","MACD","Fibonacci Zone"] if c in df_r.columns]
+                st.dataframe(df_r[scan_display], use_container_width=True, hide_index=True)
+
+                st.subheader("📊  Deep-Dive Chart")
+                triggered = [r["Ticker"] for r in results]
+                view_sym  = st.selectbox("Select a ticker (sorted by score)", triggered, key="scanner_chart_pick")
+
+                if view_sym in figs:
+                    fig, fib, breakdown = _unpack_chart_entry(figs[view_sym])
+                    if fig: st.plotly_chart(fig, use_container_width=True)
+                    render_signal_breakdown(breakdown)
+                    if not view_sym.endswith("-USD"): render_insider_section(view_sym)
+                    stock_metrics = next((r for r in results if r["Ticker"]==view_sym),{})
+                    ins_df = get_insider_data(view_sym) if not view_sym.endswith("-USD") else None
+                    show_ai_report(f"scanner_{view_sym}", view_sym, stock_metrics,
+                                   cached_period, cached_method, fib,
+                                   extra_context=insider_summary(ins_df),
+                                   button_label="🤖  AI Analysis for this stock")
+            else:
+                st.warning(f"No stocks scored ≥{cached_thresh}/14 in the cached scan. Try lowering the threshold or relaunching.")
 
     with tab_crypto:
         st.subheader("₿  Major Crypto Dashboard")
