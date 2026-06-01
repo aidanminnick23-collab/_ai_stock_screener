@@ -1,6 +1,24 @@
 # ================================================================
-# WALL STREET AI DASHBOARD — Production Build v2.11
-# v2.11 patches (incremental on v2.10):
+# WALL STREET AI DASHBOARD — Production Build v2.12
+# v2.12 patches (incremental on v2.11):
+#   NEW: 📈 Options Lab — pure educational sandbox for options trading
+#        • 4 single-leg strategies: Long Call, Long Put, Cash-Secured Put, Covered Call
+#        • Liquidity filter: OI ≥100, vol ≥10, spread ≤10%, DTE 14-90
+#        • Full Greek suite (Δ, Γ, Θ, V, Ρ) computed via Black-Scholes (no scipy)
+#        • Three sub-tabs: Chain Explorer · Strategy Analyzer · Paper Trades
+#        • AI is an ANALYZER (not recommender) — explains user-selected trades
+#          in context of the underlying's actual technical setup
+#        • Paper trades stored in Supabase, auto-revalued daily, auto-expire
+#        • Expiring-tomorrow banner + auto-close at intrinsic value on expiry
+#   NEW: 👁️ Watch List — track tickers without owning them
+#        • New 'watchlists' table in Supabase, soft cap 50 tickers
+#        • Sidebar form parallel to Quick Add Position
+#        • Fresh signals from watch list appear in same notification box,
+#          sectioned under '💼 Your Holdings' and '👁️ Watch List' subheaders
+#        • Auto-removes from watch list when ticker added to portfolio
+#          (via Quick Add, Buy trade, or portfolio editor save)
+# ================================================================
+# Previous (v2.11):
 #   NEW: OpenInsider is now the PRIMARY insider data source (per-ticker)
 #        — scrapes SEC Form 4 directly, more reliable than yfinance
 #   NEW: get_insider_data() unified helper (OpenInsider → yfinance fallback)
@@ -33,7 +51,8 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import hashlib, json, requests, re, time
+import hashlib, json, requests, re, time, math
+from datetime import datetime, timedelta
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
@@ -131,6 +150,56 @@ SCORE_THRESHOLDS = {
 
 # Freshness window for portfolio alerts (trading days)
 FRESH_SIGNAL_WINDOW = 5
+
+# ── Watch list ────────────────────────────────────────────────
+WATCHLIST_CAP = 50  # soft cap on watchlist size
+
+# ── Options Lab ───────────────────────────────────────────────
+RISK_FREE_RATE     = 0.045   # ~1-year US Treasury rate, 2026
+MIN_OPTION_OI      = 100     # liquidity filter: open interest
+MIN_OPTION_VOL     = 10      # liquidity filter: daily volume
+MAX_OPTION_SPREAD  = 0.10    # max bid-ask spread as % of mid (10%)
+MIN_OPTION_DTE     = 14      # min days to expiration
+MAX_OPTION_DTE     = 90      # max days to expiration
+
+OPTIONS_STRATEGIES = {
+    "Long Call": {
+        "type": "call",  "direction": "long",
+        "description": "Buy a call option. Bullish — profits if stock rises significantly before expiration.",
+        "max_loss": "Premium paid (limited)",
+        "max_profit": "Unlimited",
+        "best_for": "Strong directional uptrend with clear catalyst or fresh BUY crossover",
+        "worst_for": "Sideways or declining stock; time decay erodes value daily",
+        "complexity": "Beginner",
+    },
+    "Long Put": {
+        "type": "put",   "direction": "long",
+        "description": "Buy a put option. Bearish — profits if stock falls significantly before expiration.",
+        "max_loss": "Premium paid (limited)",
+        "max_profit": "(Strike × 100) minus premium (if stock goes to $0)",
+        "best_for": "Strong directional downtrend or as portfolio hedge",
+        "worst_for": "Sideways or rising stock; time decay works against you",
+        "complexity": "Beginner",
+    },
+    "Cash-Secured Put": {
+        "type": "put",   "direction": "short",
+        "description": "Sell a put while holding enough cash to buy 100 shares at strike if assigned. Income strategy for stocks you'd like to own.",
+        "max_loss": "(Strike − premium) × 100 (if stock goes to $0)",
+        "max_profit": "Premium received (if put expires worthless)",
+        "best_for": "Stocks you'd be happy to own at strike price; sideways-to-up markets; high IV environments",
+        "worst_for": "Sharp downturns — you'll be assigned shares below current market",
+        "complexity": "Intermediate",
+    },
+    "Covered Call": {
+        "type": "call",  "direction": "short",
+        "description": "Sell a call against 100 shares you already own. Generates income but caps upside.",
+        "max_loss": "Stock can still fall to $0; premium provides a small buffer",
+        "max_profit": "(Strike − cost basis) × 100 + premium received",
+        "best_for": "Stocks you're holding through sideways or mild-up moves; want income; not expecting a breakout",
+        "worst_for": "Stocks about to rally hard — you cap your upside at the strike",
+        "complexity": "Intermediate",
+    },
+}
 
 # ── International ADR / Dual-Listed Universe ──────────────────────
 INTERNATIONAL_ADRS = sorted(list(set([
@@ -290,6 +359,141 @@ def calc_confluence_score(
     return score, label, breakdown
 
 # ================================================================
+# OPTIONS MATH — Black-Scholes-Merton Greeks (no scipy required)
+# ================================================================
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF using error function."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _norm_pdf(x: float) -> float:
+    """Standard normal PDF."""
+    return math.exp(-x * x / 2.0) / math.sqrt(2.0 * math.pi)
+
+def bs_greeks(S, K, T, r, sigma, opt_type="call"):
+    """
+    Black-Scholes-Merton Greeks for a European option.
+
+    S      : spot price
+    K      : strike price
+    T      : time to expiration in years (DTE / 365)
+    r      : risk-free rate (decimal, e.g. 0.045 for 4.5%)
+    sigma  : implied volatility (decimal, e.g. 0.30 for 30%)
+    opt_type: 'call' or 'put'
+
+    Returns dict with delta, gamma, theta (per day), vega (per 1% IV), rho (per 1% rate).
+    Falls back to zero values for invalid inputs (T<=0, sigma<=0, etc.) rather than raising.
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0}
+
+    sqrt_T = math.sqrt(T)
+    try:
+        d1 = (math.log(S/K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    except (ValueError, ZeroDivisionError):
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0}
+    d2 = d1 - sigma * sqrt_T
+
+    pdf_d1 = _norm_pdf(d1)
+    gamma  = pdf_d1 / (S * sigma * sqrt_T)
+    vega   = S * pdf_d1 * sqrt_T / 100.0   # per 1% IV change
+
+    if opt_type == "call":
+        delta     = _norm_cdf(d1)
+        theta_yr  = -(S * pdf_d1 * sigma) / (2 * sqrt_T) - r * K * math.exp(-r*T) * _norm_cdf(d2)
+        rho       = K * T * math.exp(-r*T) * _norm_cdf(d2) / 100.0
+    else:  # put
+        delta     = _norm_cdf(d1) - 1.0
+        theta_yr  = -(S * pdf_d1 * sigma) / (2 * sqrt_T) + r * K * math.exp(-r*T) * _norm_cdf(-d2)
+        rho       = -K * T * math.exp(-r*T) * _norm_cdf(-d2) / 100.0
+
+    return {
+        "delta": round(delta, 4),
+        "gamma": round(gamma, 4),
+        "theta": round(theta_yr / 365.0, 4),  # per day
+        "vega":  round(vega, 4),
+        "rho":   round(rho, 4),
+    }
+
+def prob_above(S, K, T, r, sigma, target):
+    """Probability stock price at expiration > target (lognormal)."""
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > target else 0.0
+    try:
+        d = (math.log(S/target) + (r - 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    except (ValueError, ZeroDivisionError):
+        return 0.5
+    return _norm_cdf(d)
+
+def strategy_metrics(strategy_name, S, K, premium, T, sigma, r=RISK_FREE_RATE, stock_cost_basis=None):
+    """
+    Compute max profit / max loss / breakeven / probability of profit for a single-leg strategy.
+    All amounts per single contract (100 shares).
+    Returns dict.
+    """
+    info = OPTIONS_STRATEGIES[strategy_name]
+    opt_type = info["type"]; direction = info["direction"]
+
+    cost = premium * 100  # per contract
+
+    if strategy_name == "Long Call":
+        breakeven  = K + premium
+        max_profit = float("inf")
+        max_loss   = cost
+        pop        = prob_above(S, K, T, r, sigma, breakeven)  # P(S_T > BE)
+        capital    = cost
+    elif strategy_name == "Long Put":
+        breakeven  = K - premium
+        max_profit = max(K - premium, 0) * 100
+        max_loss   = cost
+        pop        = 1.0 - prob_above(S, K, T, r, sigma, breakeven)  # P(S_T < BE)
+        capital    = cost
+    elif strategy_name == "Cash-Secured Put":
+        breakeven  = K - premium   # effective cost basis if assigned
+        max_profit = cost          # credit received
+        max_loss   = (K - premium) * 100
+        pop        = prob_above(S, K, T, r, sigma, K)  # keep credit if S_T > K
+        capital    = K * 100       # cash reserved
+    elif strategy_name == "Covered Call":
+        if stock_cost_basis is None: stock_cost_basis = S  # assume current price if not specified
+        breakeven  = stock_cost_basis - premium
+        max_profit = (K - stock_cost_basis) * 100 + cost
+        # Max loss = full stock loss minus premium received (stock can go to 0)
+        max_loss   = stock_cost_basis * 100 - cost
+        pop        = 1.0 - prob_above(S, K, T, r, sigma, K)  # keep stock + premium if S_T < K
+        capital    = stock_cost_basis * 100
+    else:
+        return None
+
+    return {
+        "strategy":   strategy_name,
+        "breakeven":  breakeven,
+        "max_profit": max_profit,
+        "max_loss":   max_loss,
+        "pop":        pop,
+        "capital":    capital,
+        "premium":    premium,
+        "strike":     K,
+        "spot":       S,
+        "dte_days":   T * 365,
+        "iv":         sigma,
+    }
+
+def strategy_payoff_at_expiry(strategy_name, K, premium, S_T, stock_cost_basis=None):
+    """P&L per contract (100 shares) at expiration given final stock price S_T."""
+    if strategy_name == "Long Call":
+        return (max(S_T - K, 0) - premium) * 100
+    elif strategy_name == "Long Put":
+        return (max(K - S_T, 0) - premium) * 100
+    elif strategy_name == "Cash-Secured Put":
+        return (premium - max(K - S_T, 0)) * 100
+    elif strategy_name == "Covered Call":
+        if stock_cost_basis is None: stock_cost_basis = K
+        # Long stock P&L (capped at strike) + premium collected
+        stock_pnl = (min(S_T, K) - stock_cost_basis) * 100
+        return stock_pnl + premium * 100
+    return 0.0
+
+# ================================================================
 # TICKER NORMALISATION
 # ================================================================
 def normalize_ticker(raw: str) -> str:
@@ -358,6 +562,89 @@ def save_position_to_db(user_id, pin, ticker, shares, cost):
         return True
     except Exception as e:
         st.error(f"Save error: {e}"); return False
+
+# ================================================================
+# WATCHLIST DB
+# ================================================================
+def load_watchlist_from_db(user_id):
+    """Returns list of watchlist tickers for the user (no PIN check needed — non-sensitive)."""
+    if not SUPABASE_AVAILABLE: return []
+    try:
+        result = db.table("watchlists").select("ticker").eq("user_id", user_id).execute()
+        return [row["ticker"] for row in (result.data or [])]
+    except Exception as e:
+        # Table may not exist yet — silent for graceful degradation
+        return []
+
+def save_watchlist_ticker(user_id, pin, ticker):
+    if not SUPABASE_AVAILABLE: return False
+    try:
+        db.table("watchlists").upsert({
+            "user_id": user_id, "pin_hash": hash_pin(pin), "ticker": ticker
+        }, on_conflict="user_id,ticker").execute()
+        return True
+    except Exception as e:
+        st.error(f"Watchlist save error: {e}"); return False
+
+def remove_watchlist_ticker(user_id, ticker):
+    if not SUPABASE_AVAILABLE: return False
+    try:
+        db.table("watchlists").delete().eq("user_id", user_id).eq("ticker", ticker).execute()
+        return True
+    except Exception:
+        return False
+
+def auto_remove_from_watchlist(user_id, ticker):
+    """Called when a ticker is added to portfolio — removes from watch list if present."""
+    if not SUPABASE_AVAILABLE: return
+    wl = st.session_state.get("user_watchlist", [])
+    if ticker in wl:
+        wl.remove(ticker)
+        st.session_state["user_watchlist"] = wl
+        remove_watchlist_ticker(user_id, ticker)
+
+# ================================================================
+# PAPER OPTIONS DB
+# ================================================================
+def load_paper_options_from_db(user_id):
+    if not SUPABASE_AVAILABLE: return []
+    try:
+        result = db.table("paper_options").select("*").eq("user_id", user_id).order("entry_date", desc=True).execute()
+        return result.data or []
+    except Exception:
+        return []
+
+def save_paper_option_to_db(user_id, pin, trade: dict):
+    if not SUPABASE_AVAILABLE: return False
+    try:
+        row = {
+            "user_id":       user_id,
+            "pin_hash":      hash_pin(pin),
+            "ticker":        trade["ticker"],
+            "strategy":      trade["strategy"],
+            "strike":        float(trade["strike"]),
+            "expiration":    trade["expiration"],
+            "entry_premium": float(trade["entry_premium"]),
+            "contracts":     int(trade.get("contracts", 1)),
+            "status":        trade.get("status", "open"),
+            "notes":         trade.get("notes", ""),
+        }
+        db.table("paper_options").insert(row).execute()
+        return True
+    except Exception as e:
+        st.error(f"Paper trade save error: {e}"); return False
+
+def close_paper_option_in_db(trade_id, close_premium, status="closed"):
+    if not SUPABASE_AVAILABLE: return False
+    try:
+        db.table("paper_options").update({
+            "status":         status,
+            "close_premium":  float(close_premium),
+            "close_date":     datetime.utcnow().isoformat(),
+        }).eq("id", trade_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Paper trade close error: {e}"); return False
 
 # ================================================================
 # TICKER LOADERS  (disk-persisted for multi-user efficiency)
@@ -887,6 +1174,163 @@ def get_openinsider_per_ticker(symbol):
         return None
 
 # ================================================================
+# OPTIONS DATA — chains, liquidity filter, Greeks enrichment
+# ================================================================
+@st.cache_data(ttl=600, show_spinner=False)
+def get_option_expirations(symbol: str):
+    """
+    Returns list of (expiration_str, dte) tuples for expirations between
+    MIN_OPTION_DTE and MAX_OPTION_DTE days. Empty list if none qualify.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        all_exps = ticker.options
+        if not all_exps:
+            return []
+        today = datetime.now().date()
+        filtered = []
+        for exp in all_exps:
+            try:
+                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                dte = (exp_date - today).days
+                if MIN_OPTION_DTE <= dte <= MAX_OPTION_DTE:
+                    filtered.append((exp, dte))
+            except Exception:
+                continue
+        return filtered
+    except Exception:
+        return []
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_option_chain_raw(symbol: str, expiration: str):
+    """Returns (calls_df, puts_df) for a ticker/expiration. Empty DFs on failure."""
+    try:
+        chain = yf.Ticker(symbol).option_chain(expiration)
+        return chain.calls.copy(), chain.puts.copy()
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+def filter_liquid_options(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply liquidity filter to an options chain DataFrame.
+    Returns filtered DF; original df is preserved.
+    """
+    if df is None or df.empty:
+        return df
+    f = df.copy()
+    # Normalize: yfinance sometimes has NaN volume / openInterest
+    for col in ["volume", "openInterest", "bid", "ask"]:
+        if col in f.columns:
+            f[col] = pd.to_numeric(f[col], errors="coerce").fillna(0)
+
+    # Filter: OI ≥ 100, volume ≥ 10, bid > 0, spread within tolerance
+    mask = (
+        (f.get("openInterest", 0) >= MIN_OPTION_OI) &
+        (f.get("volume",       0) >= MIN_OPTION_VOL) &
+        (f.get("bid",          0) >  0) &
+        (f.get("ask",          0) >  0)
+    )
+    f = f[mask].copy()
+
+    # Bid-ask spread check
+    f["mid"] = (f["bid"] + f["ask"]) / 2.0
+    f["spread_pct"] = (f["ask"] - f["bid"]) / f["mid"].replace(0, np.nan)
+    # Allow either pct spread OR absolute ≤ $0.10 for cheap contracts
+    spread_ok = (f["spread_pct"] <= MAX_OPTION_SPREAD) | ((f["ask"] - f["bid"]) <= 0.10)
+    f = f[spread_ok].copy()
+    return f
+
+def enrich_chain_with_greeks(df: pd.DataFrame, S: float, T_years: float, opt_type: str):
+    """Add delta, gamma, theta, vega, rho columns to a filtered chain DataFrame."""
+    if df is None or df.empty:
+        return df
+    rows = []
+    for _, row in df.iterrows():
+        K     = float(row.get("strike", 0))
+        sigma = float(row.get("impliedVolatility", 0))
+        g = bs_greeks(S, K, T_years, RISK_FREE_RATE, sigma, opt_type)
+        rows.append(g)
+    g_df = pd.DataFrame(rows, index=df.index)
+    return pd.concat([df, g_df], axis=1)
+
+# ================================================================
+# OPTIONS PAYOFF DIAGRAM
+# ================================================================
+def render_payoff_diagram(strategy_name, S, K, premium, breakeven, max_profit, max_loss, cost_basis=None):
+    """Plotly payoff diagram at expiration. Returns figure."""
+    # Generate price range: ±40% from spot, centered on max(K, S)
+    center = max(K, S)
+    lo = max(center * 0.5, 0.01)
+    hi = center * 1.5
+    prices = np.linspace(lo, hi, 200)
+
+    payoffs = np.array([
+        strategy_payoff_at_expiry(strategy_name, K, premium, p, cost_basis)
+        for p in prices
+    ])
+
+    fig = go.Figure()
+
+    # Zero P&L horizontal reference
+    fig.add_hline(y=0, line_color="rgba(180,180,180,0.4)", line_width=1)
+
+    # Profit region (green fill above zero)
+    fig.add_trace(go.Scatter(
+        x=prices, y=np.where(payoffs > 0, payoffs, 0),
+        fill="tozeroy", fillcolor="rgba(76,175,80,0.18)",
+        line=dict(color="rgba(76,175,80,0)"), showlegend=False, hoverinfo="skip"
+    ))
+    # Loss region (red fill below zero)
+    fig.add_trace(go.Scatter(
+        x=prices, y=np.where(payoffs < 0, payoffs, 0),
+        fill="tozeroy", fillcolor="rgba(244,67,54,0.18)",
+        line=dict(color="rgba(244,67,54,0)"), showlegend=False, hoverinfo="skip"
+    ))
+    # P&L line itself
+    fig.add_trace(go.Scatter(
+        x=prices, y=payoffs, name="P&L at Expiration",
+        line=dict(color="#4fc3f7", width=2.5),
+        hovertemplate="Stock @ $%{x:.2f}<br>P&L: $%{y:,.0f}<extra></extra>"
+    ))
+
+    # Reference lines
+    fig.add_vline(x=S, line_dash="dash", line_color="#4fc3f7", line_width=1.5,
+                  annotation_text=f"Current ${S:.2f}", annotation_position="top",
+                  annotation_font_size=10, annotation_font_color="#4fc3f7")
+    fig.add_vline(x=K, line_dash="dot", line_color="#ffa726", line_width=1.5,
+                  annotation_text=f"Strike ${K:.2f}", annotation_position="top right",
+                  annotation_font_size=10, annotation_font_color="#ffa726")
+    if breakeven and lo <= breakeven <= hi:
+        fig.add_vline(x=breakeven, line_dash="dash", line_color="#ffd54f", line_width=1.2,
+                      annotation_text=f"BE ${breakeven:.2f}", annotation_position="bottom",
+                      annotation_font_size=10, annotation_font_color="#ffd54f")
+
+    # Horizontal max profit / max loss lines (only if finite & visible)
+    if max_profit not in (None, float("inf")) and abs(max_profit) < 1e7:
+        fig.add_hline(y=max_profit, line_dash="dot", line_color="rgba(76,175,80,0.6)",
+                      annotation_text=f"Max Profit ${max_profit:,.0f}",
+                      annotation_position="right", annotation_font_size=10,
+                      annotation_font_color="rgba(76,175,80,0.9)")
+    if max_loss not in (None, float("inf")):
+        fig.add_hline(y=-abs(max_loss), line_dash="dot", line_color="rgba(244,67,54,0.6)",
+                      annotation_text=f"Max Loss -${abs(max_loss):,.0f}",
+                      annotation_position="right", annotation_font_size=10,
+                      annotation_font_color="rgba(244,67,54,0.9)")
+
+    fig.update_layout(
+        template="plotly_dark", height=420,
+        title=f"{strategy_name} — Payoff at Expiration  (per 1 contract = 100 shares)",
+        xaxis_title="Stock Price at Expiration ($)",
+        yaxis_title="Profit / Loss ($)",
+        margin=dict(l=40, r=60, t=60, b=40),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,15,25,1)",
+        showlegend=False,
+    )
+    fig.update_xaxes(gridcolor="#1e1e2e")
+    fig.update_yaxes(gridcolor="#1e1e2e", zerolinecolor="rgba(180,180,180,0.4)")
+    return fig
+
+# ================================================================
 # PERFORMANCE CACHE — retry-with-backoff, longer TTL
 # ================================================================
 @st.cache_data(ttl=900, show_spinner=False)  # 15 min cache
@@ -1229,6 +1673,100 @@ Bull risk, bear risk, invalidation price, stop-loss zone (specific price range).
     return "### All Gemini models failed\n\n1. [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) → Create fresh key\n2. Streamlit → Settings → Secrets → `GEMINI_API_KEY = \"key\"`\n\n**Errors:**\n" + "\n".join(f"- {e}" for e in errors)
 
 # ================================================================
+# OPTIONS AI ANALYZER — analyzer, not recommender
+# ================================================================
+def generate_options_ai_analysis(symbol, strategy_name, metrics_options, technical_metrics, greeks):
+    """
+    Educational AI analyzer for a user-selected options strategy.
+    Receives BOTH the options-specific metrics (strike, premium, POP, etc.)
+    AND the underlying technical setup (confluence score, RSI, MA signal, etc.)
+    so the AI can ground its explanation in the actual chart context.
+
+    The AI's role is to EXPLAIN, NOT RECOMMEND. It walks through what the
+    trade is betting on, how the technical setup either supports or argues
+    against that bet, what conditions favor it, and what would kill it.
+    """
+    if not AI_AVAILABLE: return "⚠️ AI unavailable — GEMINI_API_KEY not in Secrets."
+
+    info = OPTIONS_STRATEGIES.get(strategy_name, {})
+    opt_type = info.get("type", "?"); direction = info.get("direction", "?")
+
+    # Strip private keys before sending technical context
+    tech_public = {k: v for k, v in technical_metrics.items() if not k.startswith("_")}
+
+    # Format greeks for readability
+    greeks_str = (
+        f"Delta: {greeks['delta']:+.4f}  "
+        f"Gamma: {greeks['gamma']:.4f}  "
+        f"Theta: {greeks['theta']:+.4f}/day  "
+        f"Vega: {greeks['vega']:+.4f}/1% IV  "
+        f"Rho: {greeks['rho']:+.4f}/1% rate"
+    )
+
+    prompt = f"""
+You are an options education specialist. The user is a comfortable equity trader new to options.
+Explain — DO NOT RECOMMEND — the trade they're considering.
+
+This is a PURELY EDUCATIONAL SANDBOX. No real money is involved. The user wants to UNDERSTAND
+this trade, not be told whether to enter it.
+
+═══ TRADE BEING ANALYZED ═══
+Underlying: {symbol}
+Strategy: {strategy_name}  (option type: {opt_type}, direction: {direction})
+Strategy description: {info.get('description', '')}
+
+Trade-specific metrics:
+{json.dumps(metrics_options, indent=2, default=str)}
+
+Greeks at current spot:
+{greeks_str}
+
+═══ UNDERLYING TECHNICAL SETUP (from app's analysis) ═══
+{json.dumps(tech_public, indent=2)}
+
+═══ OUTPUT FORMAT (5 SECTIONS, BE CONCISE BUT THOROUGH) ═══
+
+## What This Trade Is Actually Betting On
+Plain English: what scenario makes money, what scenario loses, what's needed to break even.
+Use the actual numbers from the metrics provided. Avoid jargon; define terms on first use.
+
+## How the Underlying Technical Setup Supports or Argues Against This Bet
+This is the most important section. Reference the SPECIFIC technical readings:
+- Signal Strength score, MA Signal, Signal Age, RSI, MACD, Bollinger, Volume, Momentum, Fibonacci.
+- Does the chart's directional bias match what this strategy needs to profit?
+- Does the confluence score support the assumed direction?
+- A long call on a Strong Buy 9/14 setup is a very different story than a long call on a Watch List 5/14 setup. SAY WHICH ONE THIS IS.
+
+## Greek Breakdown (Plain English)
+Explain each Greek as it applies to THIS specific trade:
+- **Delta** — how much you gain/lose per $1 move in the stock (in dollar terms, not abstract decimals).
+- **Gamma** — how fast delta changes; high gamma means trade behavior shifts quickly.
+- **Theta** — how much value the position loses (long) or gains (short) per day from time decay alone. State the DOLLAR amount per day.
+- **Vega** — how much value moves per 1% change in implied volatility. Explain if vega is helping or hurting given current IV environment.
+- **Rho** — sensitivity to interest rate changes. For short-dated retail trades this is usually small; explain its real-world relevance honestly (often minimal for trades under 90 DTE).
+
+## Conditions That Favor This Trade
+3-4 specific conditions, ideally referencing the actual current setup. Be honest if conditions are NOT favorable.
+
+## Conditions That Would Kill This Trade
+3-4 specific failure modes. Time decay, IV crush, directional move against, assignment risk for shorts, etc.
+For Cash-Secured Puts: explain what happens if assigned. For Covered Calls: explain what happens if called away.
+
+CRITICAL FORMATTING RULES:
+- Use clean markdown only. Never nest bold markers.
+- When writing dollar amounts, separate them with words ("the $105 strike", "premium of $2.50"), never run them together.
+- Do not tell the user whether to enter this trade. EXPLAIN, do not RECOMMEND.
+- Be honest about uncertainty. If the technical setup doesn't support this strategy, SAY SO clearly.
+"""
+    errors = []
+    for m in GEMINI_MODEL_CANDIDATES:
+        try:
+            resp = gemini_client.models.generate_content(model=m, contents=prompt)
+            return f"*Educational analysis · Model: `{m}`*\n\n" + resp.text
+        except Exception as e: errors.append(f"**{m}:** {str(e)[:120]}")
+    return "⚠️ AI analysis failed.\n\n" + "\n".join(f"- {e}" for e in errors)
+
+# ================================================================
 # BATCH SCANNER — with pre-warm fetch
 # ================================================================
 def scan_tickers(ticker_list, period, calc_type, min_score=6, max_workers=8):
@@ -1270,50 +1808,63 @@ def scan_tickers(ticker_list, period, calc_type, min_score=6, max_workers=8):
 # ================================================================
 # PORTFOLIO SIGNAL NOTIFICATIONS — fresh-only, compact
 # ================================================================
-def render_portfolio_alerts(charts: dict):
-    """
-    Show only signals where crossover happened in the last FRESH_SIGNAL_WINDOW
-    trading days. Compact one-line format. Hides entirely if nothing fresh.
-    """
+def _classify_alerts(charts: dict):
+    """Helper: returns (fresh_buys, fresh_sells) lists from charts dict."""
     fresh_buys, fresh_sells = [], []
     for sym, entry in charts.items():
         fig, fib, metrics = _unpack_chart_entry(entry)
         if not isinstance(metrics, dict): continue
-
         bars_since = metrics.get("_bars_since_signal", 999)
         if not isinstance(bars_since, (int, float)) or bars_since > FRESH_SIGNAL_WINDOW:
             continue
-
         signal = metrics.get("MA Signal", "")
         label  = ticker_label(sym)
         price  = metrics.get("Price", "—")
         strength = metrics.get("Signal Strength", "—")
         age    = metrics.get("Signal Age", "—")
-
         if "BUY" in signal:
             fresh_buys.append((label, signal, price, strength, age, int(bars_since)))
         elif "SELL" in signal:
             fresh_sells.append((label, signal, price, strength, age, int(bars_since)))
-
-    if not fresh_buys and not fresh_sells:
-        return  # hide entirely — no notification clutter
-
-    # Sort each group by freshness (newest first)
     fresh_buys.sort(key=lambda x: x[5])
     fresh_sells.sort(key=lambda x: x[5])
+    return fresh_buys, fresh_sells
 
-    total = len(fresh_buys) + len(fresh_sells)
+def render_portfolio_alerts(portfolio_charts: dict, watchlist_charts: dict = None):
+    """
+    Show fresh signals (≤ FRESH_SIGNAL_WINDOW trading days) from both portfolio
+    and watch list. Two sectioned subheaders inside a single bordered container.
+    Hides entirely if nothing fresh in either source.
+    """
+    watchlist_charts = watchlist_charts or {}
+    p_buys, p_sells = _classify_alerts(portfolio_charts)
+    w_buys, w_sells = _classify_alerts(watchlist_charts)
+
+    total = len(p_buys) + len(p_sells) + len(w_buys) + len(w_sells)
+    if total == 0:
+        return  # hide entirely — no notification clutter
+
     with st.container(border=True):
         st.markdown(f"### 🔔  Fresh Signals — Last {FRESH_SIGNAL_WINDOW} Trading Days")
-        st.caption(f"{total} active signal(s) from your portfolio. Older signals are filtered out.")
-        for label, signal, price, strength, age, _bars in fresh_buys:
-            st.markdown(
-                f"🟢 **{label}** — {signal} · {age} · {price} · {strength}"
-            )
-        for label, signal, price, strength, age, _bars in fresh_sells:
-            st.markdown(
-                f"🔴 **{label}** — {signal} · {age} · {price} · {strength}"
-            )
+        st.caption(f"{total} active signal(s). Older signals are filtered out.")
+
+        # ── Section 1: Your Holdings ───────────────────────
+        if p_buys or p_sells:
+            st.markdown("**💼 Your Holdings**")
+            for label, signal, price, strength, age, _bars in p_buys:
+                st.markdown(f"🟢 **{label}** — {signal} · {age} · {price} · {strength}")
+            for label, signal, price, strength, age, _bars in p_sells:
+                st.markdown(f"🔴 **{label}** — {signal} · {age} · {price} · {strength}")
+
+        # ── Section 2: Watch List ──────────────────────────
+        if w_buys or w_sells:
+            if p_buys or p_sells:
+                st.markdown("")  # visual gap
+            st.markdown("**👁️ Watch List**")
+            for label, signal, price, strength, age, _bars in w_buys:
+                st.markdown(f"🟢 **{label}** — {signal} · {age} · {price} · {strength}")
+            for label, signal, price, strength, age, _bars in w_sells:
+                st.markdown(f"🔴 **{label}** — {signal} · {age} · {price} · {strength}")
 
 # ================================================================
 # TRADE LOG — Buy/Sell with cost averaging
@@ -1388,7 +1939,67 @@ def render_trade_form(portfolio: dict, uid: str, pin: str):
                     save_position_to_db(uid, pin, t, pos["shares"], pos["cost"])
                 for t in set(portfolio.keys()) - set(new_portfolio.keys()):
                     save_position_to_db(uid, pin, t, 0, 0)
+            # Auto-remove newly added/updated tickers from watch list
+            if is_buy and ticker in new_portfolio:
+                auto_remove_from_watchlist(uid, ticker)
             st.rerun()
+
+# ================================================================
+# WATCH LIST UI
+# ================================================================
+def render_watchlist_form(watchlist: list, uid: str, pin: str):
+    """Sidebar UI for adding/removing tickers from watch list."""
+    with st.expander("👁️  Watch List", expanded=False):
+        st.caption(
+            f"Track tickers you're monitoring (not owned). Fresh signals on these "
+            f"appear in the notification box alongside your holdings. "
+            f"Soft cap: {WATCHLIST_CAP} tickers."
+        )
+        # Add form
+        with st.form("watchlist_form", clear_on_submit=True):
+            wl_input = st.text_input(
+                "Add Ticker", placeholder="AAPL · NVDA · ETH · BTC",
+                help="Crypto auto-detected — no suffix needed.",
+            ).strip()
+            wl_add = st.form_submit_button("➕ Add to Watch List", use_container_width=True)
+        if wl_add and wl_input:
+            new_tkr = normalize_ticker(wl_input)
+            if not new_tkr:
+                st.warning("Enter a ticker symbol.")
+            elif new_tkr in watchlist:
+                st.info(f"{ticker_label(new_tkr)} is already on your watch list.")
+            elif len(watchlist) >= WATCHLIST_CAP:
+                st.warning(
+                    f"You have {WATCHLIST_CAP} watch list items — consider removing "
+                    f"inactive ones before adding more."
+                )
+            else:
+                # Check if already in portfolio
+                portfolio = st.session_state.get("user_portfolio", {})
+                if new_tkr in portfolio:
+                    st.info(f"{ticker_label(new_tkr)} is already in your portfolio — no need to watch it.")
+                else:
+                    watchlist.append(new_tkr)
+                    st.session_state["user_watchlist"] = watchlist
+                    if SUPABASE_AVAILABLE:
+                        save_watchlist_ticker(uid, pin, new_tkr)
+                    st.success(f"✅ Added {ticker_label(new_tkr)} to watch list")
+                    st.rerun()
+
+        # Current list with remove buttons
+        if watchlist:
+            st.markdown(f"**Currently watching ({len(watchlist)}/{WATCHLIST_CAP}):**")
+            for tkr in sorted(watchlist):
+                cols = st.columns([4, 1])
+                cols[0].markdown(f"👁️ {ticker_label(tkr)}")
+                if cols[1].button("✕", key=f"rmwl_{tkr}", help=f"Remove {ticker_label(tkr)}"):
+                    watchlist.remove(tkr)
+                    st.session_state["user_watchlist"] = watchlist
+                    if SUPABASE_AVAILABLE:
+                        remove_watchlist_ticker(uid, tkr)
+                    st.rerun()
+        else:
+            st.caption("_Watch list is empty._")
 
 # ================================================================
 # DISPLAY HELPERS
@@ -1491,10 +2102,14 @@ def render_portfolio_editor(portfolio: dict, uid: str, pin: str):
                 if not ticker or shares == 0: continue
                 new_portfolio[ticker] = {"shares": shares, "cost": cost}
             deleted = set(portfolio.keys()) - set(new_portfolio.keys())
+            added   = set(new_portfolio.keys()) - set(portfolio.keys())
             if SUPABASE_AVAILABLE:
                 for t,pos in new_portfolio.items(): save_position_to_db(uid,pin,t,pos["shares"],pos["cost"])
                 for t in deleted: save_position_to_db(uid,pin,t,0,0)
             st.session_state["user_portfolio"] = new_portfolio
+            # Auto-remove newly added tickers from watch list
+            for t in added:
+                auto_remove_from_watchlist(uid, t)
             if deleted: st.info(f"🗑️  Removed: {', '.join(deleted)}")
             st.success(f"✅ Portfolio saved — {len(new_portfolio)} position(s)")
             st.rerun()
@@ -1541,7 +2156,7 @@ with st.sidebar:
     st.divider()
     st.caption("🔒 Shared institutional API — no personal key needed.")
 
-mode = st.radio("Mode", ["💼  My Portfolio","🔍  Analyze Single Asset","🌐  Market Scanner"],
+mode = st.radio("Mode", ["💼  My Portfolio","🔍  Analyze Single Asset","🌐  Market Scanner","📈  Options Lab"],
                 horizontal=True, label_visibility="collapsed")
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1552,7 +2167,7 @@ if mode == "💼  My Portfolio":
     st.header("💼  Portfolio Dashboard")
 
     if not SUPABASE_AVAILABLE:
-        for k,v in [("user_portfolio",{}),("auth_user","local"),("auth_pin","")]:
+        for k,v in [("user_portfolio",{}),("auth_user","local"),("auth_pin",""),("user_watchlist",[])]:
             if k not in st.session_state: st.session_state[k] = v
         st.info("☁️ Cloud storage not configured — portfolio resets on page refresh.")
 
@@ -1572,7 +2187,13 @@ if mode == "💼  My Portfolio":
                     portfolio_db = load_portfolio_from_db(uid, pin)
                 if portfolio_db is None: st.error("❌ Incorrect PIN.")
                 else:
-                    st.session_state.update({"auth_user":uid,"auth_pin":pin,"user_portfolio":portfolio_db})
+                    # Load watchlist + paper options alongside portfolio
+                    watchlist_db = load_watchlist_from_db(uid)
+                    st.session_state.update({
+                        "auth_user": uid, "auth_pin": pin,
+                        "user_portfolio": portfolio_db,
+                        "user_watchlist": watchlist_db,
+                    })
                     st.rerun()
         st.stop()
 
@@ -1598,11 +2219,20 @@ if mode == "💼  My Portfolio":
             else:
                 st.session_state["user_portfolio"][new_ticker] = {"shares":new_shares,"cost":new_cost}
                 if SUPABASE_AVAILABLE: save_position_to_db(uid_, pin_, new_ticker, new_shares, new_cost)
+                # Auto-remove from watch list since it's now a holding
+                auto_remove_from_watchlist(uid_, new_ticker)
                 st.success(f"✅ {new_ticker} added")
 
         st.divider()
         render_trade_form(
             st.session_state.get("user_portfolio",{}),
+            st.session_state.get("auth_user","local"),
+            st.session_state.get("auth_pin","")
+        )
+
+        st.divider()
+        render_watchlist_form(
+            st.session_state.get("user_watchlist", []),
             st.session_state.get("auth_user","local"),
             st.session_state.get("auth_pin","")
         )
@@ -1620,10 +2250,12 @@ if mode == "💼  My Portfolio":
         if SUPABASE_AVAILABLE:
             st.divider()
             if st.button("🚪  Log Out", use_container_width=True):
-                for k in ["auth_user","auth_pin","user_portfolio"]: st.session_state.pop(k,None)
+                for k in ["auth_user","auth_pin","user_portfolio","user_watchlist","paper_options"]:
+                    st.session_state.pop(k,None)
                 st.rerun()
 
     portfolio = st.session_state.get("user_portfolio", {})
+    watchlist = st.session_state.get("user_watchlist", [])
     uid = st.session_state.get("auth_user","local")
     pin = st.session_state.get("auth_pin","")
 
@@ -1663,9 +2295,20 @@ if mode == "💼  My Portfolio":
                 for e in load_errors: st.warning(e)
                 st.caption("Common causes: insufficient history for the selected period. Try a shorter lookback or use the Edit table to fix tickers.")
 
-        # Fresh portfolio notifications (last 5 trading days only)
-        if charts:
-            render_portfolio_alerts(charts)
+        # ── Fetch watch list signals for the notification box ──
+        watchlist_charts = {}
+        if watchlist:
+            with st.spinner(f"Checking watch list signals ({len(watchlist)} tickers)…"):
+                for wsym in watchlist:
+                    _, w_metrics, w_fig, w_price, w_fib, w_score, w_err = fetch_technical_data(
+                        wsym, sma_period, ma_type
+                    )
+                    if not w_err and w_metrics:
+                        watchlist_charts[wsym] = (w_fig, w_fib, w_metrics)
+
+        # Fresh notifications — dual source (holdings + watch list)
+        if charts or watchlist_charts:
+            render_portfolio_alerts(charts, watchlist_charts)
 
         total_gain = total_value-total_cost
         total_pct  = (total_gain/total_cost*100) if total_cost>0 else 0.0
@@ -1954,3 +2597,524 @@ elif mode == "🌐  Market Scanner":
                 st.info("Click 'Refresh Crypto Data' to reload chart data.")
         else:
             st.info("Click 'Refresh Crypto Data' to load.")
+
+# ================================================================
+# MODE 4 — OPTIONS LAB (Educational Sandbox)
+# ================================================================
+elif mode == "📈  Options Lab":
+    st.header("📈  Options Lab — Educational Sandbox")
+    st.warning(
+        "🎓 **Pure educational sandbox.** No real money. No broker connection. "
+        "No trade recommendations — the AI here is an **analyzer**, not a recommender. "
+        "Use this to learn how options strategies behave before risking real capital."
+    )
+
+    # Initialize paper options state
+    if "paper_options" not in st.session_state:
+        uid_pap = st.session_state.get("auth_user", "local")
+        st.session_state["paper_options"] = load_paper_options_from_db(uid_pap) if SUPABASE_AVAILABLE else []
+
+    tab_chain, tab_strategy, tab_paper = st.tabs([
+        "🔍  Chain Explorer",
+        "🎯  Strategy Analyzer",
+        "📋  Paper Trades",
+    ])
+
+    # ──────────────────────────────────────────────────────────────
+    # TAB 1: CHAIN EXPLORER
+    # ──────────────────────────────────────────────────────────────
+    with tab_chain:
+        st.markdown("Browse a ticker's option chain — calls and puts with Greeks, "
+                    f"filtered for liquidity (OI ≥{MIN_OPTION_OI}, vol ≥{MIN_OPTION_VOL}, "
+                    f"spread ≤{MAX_OPTION_SPREAD*100:.0f}%, DTE {MIN_OPTION_DTE}-{MAX_OPTION_DTE}d).")
+
+        ch_c1, ch_c2 = st.columns([3, 1])
+        with ch_c1:
+            chain_ticker = st.text_input(
+                "Ticker", placeholder="AAPL · NVDA · SPY · QQQ",
+                key="chain_ticker_input"
+            ).strip().upper()
+        with ch_c2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            chain_go = st.button("Load Chain →", use_container_width=True, key="chain_load")
+
+        if chain_go and chain_ticker:
+            st.session_state["chain_loaded_ticker"] = chain_ticker
+
+        loaded_tk = st.session_state.get("chain_loaded_ticker")
+        if loaded_tk:
+            with st.spinner(f"Loading {loaded_tk} options data…"):
+                # Get current price
+                hist_for_price = _cached_history(loaded_tk, "1mo")
+                if hist_for_price.empty:
+                    st.error(f"No price data for **{loaded_tk}**. Check the ticker.")
+                else:
+                    spot = float(hist_for_price["Close"].iloc[-1])
+                    expirations = get_option_expirations(loaded_tk)
+
+            if not hist_for_price.empty:
+                if not expirations:
+                    st.error(f"No option expirations between {MIN_OPTION_DTE}-{MAX_OPTION_DTE} DTE for {loaded_tk}. "
+                             "This ticker may not have actively-traded options.")
+                else:
+                    st.success(f"✅ **{loaded_tk}** · Spot: ${spot:.2f} · {len(expirations)} valid expiration(s)")
+
+                    ec1, ec2 = st.columns([2, 1])
+                    with ec1:
+                        exp_choice = st.selectbox(
+                            "Expiration",
+                            options=[e[0] for e in expirations],
+                            format_func=lambda x: f"{x} ({next(d for e,d in expirations if e==x)}d)"
+                        )
+                    with ec2:
+                        opt_side = st.radio("Type", ["Calls", "Puts"], horizontal=True, key="chain_side")
+
+                    chosen_dte = next(d for e, d in expirations if e == exp_choice)
+                    T_years = chosen_dte / 365.0
+
+                    with st.spinner("Fetching chain…"):
+                        calls_df, puts_df = get_option_chain_raw(loaded_tk, exp_choice)
+
+                    if opt_side == "Calls":
+                        raw_df = calls_df; opt_type_str = "call"
+                    else:
+                        raw_df = puts_df; opt_type_str = "put"
+
+                    if raw_df.empty:
+                        st.warning(f"No {opt_side.lower()} returned by data provider.")
+                    else:
+                        before_n = len(raw_df)
+                        filt_df = filter_liquid_options(raw_df)
+                        after_n = len(filt_df)
+                        hidden = before_n - after_n
+                        if filt_df.empty:
+                            st.warning(f"All {before_n} contracts failed the liquidity filter. "
+                                       "Try a different expiration or ticker.")
+                        else:
+                            enriched = enrich_chain_with_greeks(filt_df, spot, T_years, opt_type_str)
+
+                            # Build display
+                            disp = pd.DataFrame()
+                            disp["Strike"]    = enriched["strike"].apply(lambda x: f"${x:.2f}")
+                            disp["ITM"]       = enriched.apply(
+                                lambda r: "🟢 ITM" if (
+                                    (opt_type_str == "call" and r["strike"] < spot) or
+                                    (opt_type_str == "put"  and r["strike"] > spot)
+                                ) else "⚪ OTM", axis=1
+                            )
+                            disp["Bid"]       = enriched["bid"].apply(lambda x: f"${x:.2f}")
+                            disp["Ask"]       = enriched["ask"].apply(lambda x: f"${x:.2f}")
+                            disp["Mid"]       = enriched["mid"].apply(lambda x: f"${x:.2f}")
+                            disp["Volume"]    = enriched["volume"].astype(int).apply(lambda x: f"{x:,}")
+                            disp["OI"]        = enriched["openInterest"].astype(int).apply(lambda x: f"{x:,}")
+                            disp["IV"]        = (enriched["impliedVolatility"] * 100).apply(lambda x: f"{x:.1f}%")
+                            disp["Δ Delta"]    = enriched["delta"].apply(lambda x: f"{x:+.3f}")
+                            disp["Γ Gamma"]    = enriched["gamma"].apply(lambda x: f"{x:.4f}")
+                            disp["Θ Theta/d"]  = enriched["theta"].apply(lambda x: f"{x:+.3f}")
+                            disp["V Vega"]    = enriched["vega"].apply(lambda x: f"{x:+.3f}")
+                            disp["P Rho"]     = enriched["rho"].apply(lambda x: f"{x:+.3f}")
+
+                            st.dataframe(disp, use_container_width=True, hide_index=True)
+                            if hidden > 0:
+                                st.caption(f"_Hidden: {hidden} illiquid contracts (failed OI/vol/spread filter)._")
+                            st.caption(
+                                "**Δ Delta**: $ gain per $1 stock move (×100 per contract) · "
+                                "**Γ Gamma**: how fast delta changes · "
+                                "**Θ Theta**: daily $ time decay (×100) · "
+                                "**V Vega**: $ per 1% IV change (×100) · "
+                                "**P Rho**: $ per 1% rate change (×100)"
+                            )
+
+    # ──────────────────────────────────────────────────────────────
+    # TAB 2: STRATEGY ANALYZER
+    # ──────────────────────────────────────────────────────────────
+    with tab_strategy:
+        st.markdown(
+            "Pick a strategy and a specific contract, then get a personalised educational "
+            "walkthrough that ties the trade to your underlying ticker's actual technical setup. "
+            "**The AI is an analyzer, not a recommender** — it explains the trade you select, "
+            "it does not tell you which trade to make."
+        )
+
+        sa_c1, sa_c2 = st.columns([2, 2])
+        with sa_c1:
+            sa_ticker = st.text_input(
+                "Underlying Ticker", placeholder="NVDA · AAPL · SPY",
+                key="sa_ticker_input"
+            ).strip().upper()
+        with sa_c2:
+            sa_strategy = st.selectbox(
+                "Strategy",
+                options=list(OPTIONS_STRATEGIES.keys()),
+                key="sa_strategy_pick"
+            )
+
+        # Strategy description card
+        info = OPTIONS_STRATEGIES[sa_strategy]
+        with st.container(border=True):
+            st.markdown(f"**{sa_strategy}** · _{info['complexity']}_")
+            st.markdown(info["description"])
+            cinfo1, cinfo2 = st.columns(2)
+            with cinfo1:
+                st.markdown(f"**Max Loss:** {info['max_loss']}")
+                st.markdown(f"**Best for:** {info['best_for']}")
+            with cinfo2:
+                st.markdown(f"**Max Profit:** {info['max_profit']}")
+                st.markdown(f"**Worst for:** {info['worst_for']}")
+
+        if sa_ticker:
+            with st.spinner(f"Loading {sa_ticker} data…"):
+                hist_sa = _cached_history(sa_ticker, "1mo")
+                expirations_sa = get_option_expirations(sa_ticker) if not hist_sa.empty else []
+
+            if hist_sa.empty:
+                st.error(f"No price data for **{sa_ticker}**.")
+            elif not expirations_sa:
+                st.error(f"No liquid expirations between {MIN_OPTION_DTE}-{MAX_OPTION_DTE} DTE for {sa_ticker}.")
+            else:
+                spot_sa = float(hist_sa["Close"].iloc[-1])
+                st.info(f"Spot: **${spot_sa:.2f}** · {len(expirations_sa)} valid expiration(s) available")
+
+                sa_e1, sa_e2 = st.columns([2, 1])
+                with sa_e1:
+                    sa_exp = st.selectbox(
+                        "Expiration",
+                        options=[e[0] for e in expirations_sa],
+                        format_func=lambda x: f"{x} ({next(d for e,d in expirations_sa if e==x)}d)",
+                        key="sa_exp_pick"
+                    )
+                with sa_e2:
+                    if sa_strategy == "Covered Call":
+                        sa_cost_basis = st.number_input(
+                            "Your stock cost basis ($)",
+                            min_value=0.01, value=float(spot_sa), step=0.01,
+                            help="What you paid per share. Used for max profit / breakeven calc."
+                        )
+                    else:
+                        sa_cost_basis = None
+
+                sa_dte = next(d for e, d in expirations_sa if e == sa_exp)
+                T_sa = sa_dte / 365.0
+
+                # Fetch + filter the relevant chain
+                with st.spinner("Loading filtered chain…"):
+                    calls_sa, puts_sa = get_option_chain_raw(sa_ticker, sa_exp)
+                    chain_sa = calls_sa if info["type"] == "call" else puts_sa
+                    chain_sa = filter_liquid_options(chain_sa)
+
+                if chain_sa.empty:
+                    st.warning("No liquid contracts in this expiration. Try a different one.")
+                else:
+                    chain_sa = enrich_chain_with_greeks(chain_sa, spot_sa, T_sa, info["type"])
+                    chain_sa = chain_sa.sort_values("strike").reset_index(drop=True)
+
+                    strike_options = chain_sa["strike"].tolist()
+                    # Default to ATM strike (closest to spot)
+                    default_idx = min(range(len(strike_options)),
+                                       key=lambda i: abs(strike_options[i] - spot_sa))
+
+                    sa_strike = st.selectbox(
+                        "Strike",
+                        options=strike_options,
+                        index=default_idx,
+                        format_func=lambda x: f"${x:.2f}  ({('ITM' if (info['type']=='call' and x<spot_sa) or (info['type']=='put' and x>spot_sa) else 'OTM')})",
+                        key="sa_strike_pick"
+                    )
+
+                    row = chain_sa[chain_sa["strike"] == sa_strike].iloc[0]
+                    sa_premium = float(row["mid"])
+                    sa_iv      = float(row["impliedVolatility"])
+                    greeks_sa  = {
+                        "delta": float(row.get("delta", 0)),
+                        "gamma": float(row.get("gamma", 0)),
+                        "theta": float(row.get("theta", 0)),
+                        "vega":  float(row.get("vega", 0)),
+                        "rho":   float(row.get("rho", 0)),
+                    }
+
+                    metrics_sa = strategy_metrics(
+                        sa_strategy, spot_sa, sa_strike, sa_premium,
+                        T_sa, sa_iv, RISK_FREE_RATE,
+                        stock_cost_basis=sa_cost_basis,
+                    )
+
+                    # Key trade metrics
+                    st.subheader("Trade Metrics")
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Premium (mid)", f"${sa_premium:.2f}")
+                    m2.metric("Breakeven", f"${metrics_sa['breakeven']:.2f}")
+                    mp = metrics_sa["max_profit"]
+                    m3.metric("Max Profit",
+                              "Unlimited" if mp == float("inf") else f"${mp:,.0f}")
+                    m4.metric("Max Loss", f"${metrics_sa['max_loss']:,.0f}")
+                    m5.metric("Prob of Profit", f"{metrics_sa['pop']*100:.1f}%")
+
+                    # Capital required
+                    cap = metrics_sa["capital"]
+                    st.caption(
+                        f"💰 **Capital required per contract:** ${cap:,.0f}  ·  "
+                        f"**IV:** {sa_iv*100:.1f}%  ·  "
+                        f"**DTE:** {sa_dte} days"
+                    )
+
+                    # Greeks display
+                    st.subheader("Greeks (per contract = 100 shares)")
+                    g1, g2, g3, g4, g5 = st.columns(5)
+                    g1.metric("Δ Delta", f"{greeks_sa['delta']:+.3f}",
+                              help=f"$ gain per $1 stock move: ${greeks_sa['delta']*100:+.2f}")
+                    g2.metric("Γ Gamma", f"{greeks_sa['gamma']:.4f}",
+                              help="How fast Delta itself changes per $1 stock move")
+                    g3.metric("Θ Theta/day", f"{greeks_sa['theta']*100:+.2f}",
+                              help="Daily time decay in $ — negative means losing value daily")
+                    g4.metric("V Vega/1% IV", f"{greeks_sa['vega']*100:+.2f}",
+                              help="$ change per 1% IV move — positive = benefits from rising IV")
+                    g5.metric("P Rho/1% rate", f"{greeks_sa['rho']*100:+.3f}",
+                              help="$ change per 1% interest rate move — usually small for retail trades")
+
+                    # Payoff diagram
+                    st.subheader("Payoff at Expiration")
+                    payoff_fig = render_payoff_diagram(
+                        sa_strategy, spot_sa, sa_strike, sa_premium,
+                        metrics_sa["breakeven"], metrics_sa["max_profit"],
+                        metrics_sa["max_loss"], cost_basis=sa_cost_basis,
+                    )
+                    st.plotly_chart(payoff_fig, use_container_width=True)
+
+                    # AI Analysis + Paper Trade button
+                    ai_col, paper_col = st.columns([3, 1])
+                    with ai_col:
+                        # Need to also fetch the technical setup to give AI context
+                        ai_key_options = f"options_ai_{sa_ticker}_{sa_strategy}_{sa_strike}_{sa_exp}"
+                        if st.button("🎓  Generate Educational Analysis", key=f"btn_{ai_key_options}",
+                                     use_container_width=True):
+                            with st.spinner("Loading technical context + analysing trade…"):
+                                # Get the technical setup for context
+                                _, tech_metrics, _, _, _, _, tech_err = fetch_technical_data(
+                                    sa_ticker, sma_period, ma_type
+                                )
+                                if tech_err: tech_metrics = {"note": "technical data unavailable"}
+                                opt_metrics_for_ai = {
+                                    "strategy":   sa_strategy,
+                                    "spot":       f"${spot_sa:.2f}",
+                                    "strike":     f"${sa_strike:.2f}",
+                                    "premium":    f"${sa_premium:.2f}",
+                                    "dte":        f"{sa_dte} days",
+                                    "iv":         f"{sa_iv*100:.1f}%",
+                                    "breakeven":  f"${metrics_sa['breakeven']:.2f}",
+                                    "max_profit": ("Unlimited" if mp == float("inf") else f"${mp:,.0f}"),
+                                    "max_loss":   f"${metrics_sa['max_loss']:,.0f}",
+                                    "pop":        f"{metrics_sa['pop']*100:.1f}%",
+                                    "capital_required": f"${cap:,.0f}",
+                                }
+                                st.session_state[ai_key_options] = generate_options_ai_analysis(
+                                    sa_ticker, sa_strategy, opt_metrics_for_ai, tech_metrics, greeks_sa
+                                )
+                        if ai_key_options in st.session_state:
+                            st.markdown("---")
+                            st.markdown(_sanitize_ai_markdown(st.session_state[ai_key_options]))
+                            if st.button("🗑️ Clear Analysis", key=f"clr_{ai_key_options}"):
+                                del st.session_state[ai_key_options]; st.rerun()
+
+                    with paper_col:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("📋  Log Paper Trade", use_container_width=True,
+                                     key=f"paper_log_{sa_ticker}_{sa_strategy}_{sa_strike}_{sa_exp}"):
+                            trade_record = {
+                                "ticker":        sa_ticker,
+                                "strategy":      sa_strategy,
+                                "strike":        sa_strike,
+                                "expiration":    sa_exp,
+                                "entry_premium": sa_premium,
+                                "contracts":     1,
+                                "status":        "open",
+                                "notes":         f"DTE entry: {sa_dte}, IV: {sa_iv*100:.1f}%",
+                            }
+                            if SUPABASE_AVAILABLE:
+                                uid_pap = st.session_state.get("auth_user","local")
+                                pin_pap = st.session_state.get("auth_pin","")
+                                ok = save_paper_option_to_db(uid_pap, pin_pap, trade_record)
+                                if ok:
+                                    st.session_state["paper_options"] = load_paper_options_from_db(uid_pap)
+                                    st.success(f"✅ Paper trade logged: {sa_strategy} {sa_ticker} ${sa_strike} exp {sa_exp}")
+                                    st.rerun()
+                            else:
+                                # Local session only
+                                trade_record["id"] = len(st.session_state.get("paper_options", []))
+                                trade_record["entry_date"] = datetime.utcnow().isoformat()
+                                st.session_state.setdefault("paper_options", []).append(trade_record)
+                                st.success(f"✅ Paper trade logged (session only — cloud not configured)")
+                                st.rerun()
+
+    # ──────────────────────────────────────────────────────────────
+    # TAB 3: PAPER TRADES
+    # ──────────────────────────────────────────────────────────────
+    with tab_paper:
+        st.markdown(
+            "Track hypothetical options trades over time. Positions are revalued daily "
+            "using live IV — you'll feel theta decay as your contracts age."
+        )
+
+        paper = st.session_state.get("paper_options", [])
+
+        if not paper:
+            st.info("No paper trades yet. Use the **Strategy Analyzer** tab to log your first hypothetical trade.")
+        else:
+            today = datetime.now().date()
+
+            # Compute current values for open positions
+            open_rows = []; closed_rows = []
+            expiring_tomorrow = []
+
+            for p in paper:
+                status = p.get("status", "open")
+                ticker = p.get("ticker"); strategy = p.get("strategy")
+                strike = float(p.get("strike", 0))
+                entry_prem = float(p.get("entry_premium", 0))
+                contracts = int(p.get("contracts", 1))
+                exp_str = str(p.get("expiration", ""))[:10]
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                dte_remaining = (exp_date - today).days
+                info_p = OPTIONS_STRATEGIES.get(strategy, {})
+
+                row = {
+                    "id":            p.get("id"),
+                    "Ticker":        ticker,
+                    "Strategy":      strategy,
+                    "Strike":        f"${strike:.2f}",
+                    "Expiration":    exp_str,
+                    "DTE":           dte_remaining,
+                    "Entry Premium": f"${entry_prem:.2f}",
+                    "Contracts":     contracts,
+                }
+
+                if status == "open" and dte_remaining > 0:
+                    # Look up current premium from live chain
+                    current_prem = None
+                    try:
+                        calls_p, puts_p = get_option_chain_raw(ticker, exp_str)
+                        cdf = calls_p if info_p.get("type") == "call" else puts_p
+                        if not cdf.empty:
+                            match = cdf[cdf["strike"] == strike]
+                            if not match.empty:
+                                bid_p = float(match.iloc[0].get("bid", 0))
+                                ask_p = float(match.iloc[0].get("ask", 0))
+                                current_prem = (bid_p + ask_p) / 2.0 if (bid_p + ask_p) > 0 else None
+                    except Exception:
+                        current_prem = None
+
+                    row["Current Premium"] = f"${current_prem:.2f}" if current_prem else "—"
+                    if current_prem is not None:
+                        # P&L direction depends on long/short
+                        if info_p.get("direction") == "long":
+                            pnl = (current_prem - entry_prem) * 100 * contracts
+                        else:  # short — profits when premium decays
+                            pnl = (entry_prem - current_prem) * 100 * contracts
+                        row["P&L ($)"] = f"${pnl:+,.0f}"
+                        row["P&L (%)"] = f"{pnl / (entry_prem * 100 * contracts) * 100:+.1f}%"
+                    else:
+                        row["P&L ($)"] = "—"; row["P&L (%)"] = "—"
+
+                    if dte_remaining == 1:
+                        expiring_tomorrow.append(row)
+
+                    open_rows.append(row)
+                elif dte_remaining <= 0 and status == "open":
+                    # Auto-expire: assume contract expired at zero (worst case for long, best for short)
+                    # Use spot at expiration for more accurate resolution
+                    try:
+                        spot_hist = _cached_history(ticker, "5d")
+                        spot_at_exp = float(spot_hist["Close"].iloc[-1]) if not spot_hist.empty else strike
+                    except Exception:
+                        spot_at_exp = strike
+                    info_p = OPTIONS_STRATEGIES.get(strategy, {})
+                    if info_p.get("type") == "call":
+                        intrinsic = max(spot_at_exp - strike, 0)
+                    else:
+                        intrinsic = max(strike - spot_at_exp, 0)
+
+                    # Auto-close at intrinsic value
+                    if p.get("id") and SUPABASE_AVAILABLE:
+                        close_paper_option_in_db(p["id"], intrinsic, status="expired")
+                    p["status"] = "expired"; p["close_premium"] = intrinsic
+                    row["Current Premium"] = f"${intrinsic:.2f} (expired)"
+                    if info_p.get("direction") == "long":
+                        pnl = (intrinsic - entry_prem) * 100 * contracts
+                    else:
+                        pnl = (entry_prem - intrinsic) * 100 * contracts
+                    row["P&L ($)"] = f"${pnl:+,.0f}"
+                    row["P&L (%)"] = f"{pnl / (entry_prem * 100 * contracts) * 100:+.1f}%"
+                    closed_rows.append(row)
+                else:
+                    # Already closed
+                    close_prem = float(p.get("close_premium", 0))
+                    info_p = OPTIONS_STRATEGIES.get(strategy, {})
+                    if info_p.get("direction") == "long":
+                        pnl = (close_prem - entry_prem) * 100 * contracts
+                    else:
+                        pnl = (entry_prem - close_prem) * 100 * contracts
+                    row["Current Premium"] = f"${close_prem:.2f}"
+                    row["P&L ($)"] = f"${pnl:+,.0f}"
+                    row["P&L (%)"] = f"{pnl / (entry_prem * 100 * contracts) * 100:+.1f}%"
+                    closed_rows.append(row)
+
+            # Expiration warning banner
+            if expiring_tomorrow:
+                with st.container(border=True):
+                    st.warning(f"⏰  **{len(expiring_tomorrow)} position(s) expire tomorrow:**")
+                    for r in expiring_tomorrow:
+                        st.markdown(f"- **{r['Ticker']}** {r['Strategy']} ${r['Strike']} (exp {r['Expiration']})")
+
+            # Open positions
+            if open_rows:
+                st.subheader(f"🟢 Open Positions ({len(open_rows)})")
+                # Display
+                disp_cols = ["Ticker","Strategy","Strike","Expiration","DTE",
+                             "Entry Premium","Current Premium","P&L ($)","P&L (%)","Contracts"]
+                df_open = pd.DataFrame(open_rows)[disp_cols]
+                st.dataframe(df_open, use_container_width=True, hide_index=True)
+
+                # Close position UI
+                with st.expander("Close a Position"):
+                    close_options = {
+                        f"{r['Ticker']} {r['Strategy']} ${r['Strike']} exp {r['Expiration']}": r["id"]
+                        for r in open_rows if r.get("id") is not None
+                    }
+                    if close_options:
+                        close_pick = st.selectbox("Position to close", list(close_options.keys()),
+                                                  key="paper_close_pick")
+                        close_prem_input = st.number_input(
+                            "Close at premium ($)", min_value=0.0, step=0.01,
+                            key="paper_close_premium"
+                        )
+                        if st.button("Confirm Close", key="paper_close_confirm"):
+                            tid = close_options[close_pick]
+                            if SUPABASE_AVAILABLE:
+                                ok = close_paper_option_in_db(tid, close_prem_input)
+                                if ok:
+                                    uid_pap = st.session_state.get("auth_user","local")
+                                    st.session_state["paper_options"] = load_paper_options_from_db(uid_pap)
+                                    st.success(f"✅ Closed: {close_pick}")
+                                    st.rerun()
+                            else:
+                                for p in st.session_state["paper_options"]:
+                                    if p.get("id") == tid:
+                                        p["status"] = "closed"
+                                        p["close_premium"] = close_prem_input
+                                        p["close_date"] = datetime.utcnow().isoformat()
+                                st.success(f"✅ Closed: {close_pick}")
+                                st.rerun()
+                    else:
+                        st.caption("_No positions with IDs available to close (session-only trades cannot be closed via this UI yet)._")
+            else:
+                st.info("No open paper trades currently.")
+
+            # Closed/expired positions
+            if closed_rows:
+                with st.expander(f"🗂️  Closed & Expired Positions ({len(closed_rows)})", expanded=False):
+                    disp_cols_c = ["Ticker","Strategy","Strike","Expiration",
+                                   "Entry Premium","Current Premium","P&L ($)","P&L (%)","Contracts"]
+                    df_closed = pd.DataFrame(closed_rows)[disp_cols_c]
+                    st.dataframe(df_closed, use_container_width=True, hide_index=True)
