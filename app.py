@@ -1,5 +1,21 @@
 # ================================================================
-# WALL STREET AI DASHBOARD — Production Build v2.12
+# WALL STREET AI DASHBOARD — Production Build v2.13
+# v2.13 patches (incremental on v2.12):
+#   NEW: 🌐 Market Regime indicator — SPY vs 50/200-day MAs + VIX
+#        • 5-tier scale: Strong Bull / Bull / Transition / Bear / Strong Bear
+#        • Compact banner at top of every mode with signal tiering guidance
+#        • "Stretched" flag for extended bull markets (parabolic warning)
+#        • AI analysis prompt now ingests regime as context — recommendations
+#          are tiered (size, threshold) by market environment
+#   PERF: Gemini + Supabase clients now @st.cache_resource (created once,
+#         reused across reruns — was recreating on every interaction)
+#   PERF: Portfolio + watchlist now use single batch_history pre-fetch +
+#         parallel indicator computation (was sequential, N-fetches one-at-a-time)
+#         Expected 3-5x speedup on dashboard reload for portfolios of 10+ holdings
+#   PERF: Cache TTL bumped 15min → 20min on _cached_history and _batch_history
+#         (less yfinance pressure, no meaningful impact on signal freshness)
+# ================================================================
+# Previous (v2.12):
 # v2.12 patches (incremental on v2.11):
 #   NEW: 📈 Options Lab — pure educational sandbox for options trading
 #        • 4 single-leg strategies: Long Call, Long Put, Cash-Secured Put, Covered Call
@@ -79,25 +95,34 @@ GEMINI_API_KEY = _secret("GEMINI_API_KEY")
 SUPABASE_URL   = _secret("SUPABASE_URL")
 SUPABASE_KEY   = _secret("SUPABASE_KEY")
 
-AI_AVAILABLE  = bool(GEMINI_API_KEY)
-gemini_client = None
 GEMINI_MODEL_CANDIDATES = [
     "gemini-2.5-pro","gemini-2.5-pro-preview-05-06",
     "gemini-2.5-pro-exp-03-25","gemini-2.5-flash-preview-04-17",
     "gemini-2.5-flash","gemini-1.5-pro",
 ]
-if AI_AVAILABLE:
-    try: gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    except: AI_AVAILABLE = False
 
-SUPABASE_AVAILABLE = False
-db = None
-try:
-    if SUPABASE_URL and SUPABASE_KEY:
+# ── External clients are cache_resource: created once, reused across reruns ──
+@st.cache_resource(show_spinner=False)
+def _init_gemini_client():
+    if not GEMINI_API_KEY: return None
+    try:
+        return genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        return None
+
+@st.cache_resource(show_spinner=False)
+def _init_supabase_client():
+    if not (SUPABASE_URL and SUPABASE_KEY): return None
+    try:
         from supabase import create_client
-        db = create_client(SUPABASE_URL, SUPABASE_KEY)
-        SUPABASE_AVAILABLE = True
-except: pass
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        return None
+
+gemini_client      = _init_gemini_client()
+AI_AVAILABLE       = gemini_client is not None
+db                 = _init_supabase_client()
+SUPABASE_AVAILABLE = db is not None
 
 # ================================================================
 # CONSTANTS
@@ -1331,9 +1356,150 @@ def render_payoff_diagram(strategy_name, S, K, premium, breakeven, max_profit, m
     return fig
 
 # ================================================================
-# PERFORMANCE CACHE — retry-with-backoff, longer TTL
+# MARKET REGIME — SPY+VIX context to interpret individual signals
 # ================================================================
 @st.cache_data(ttl=900, show_spinner=False)  # 15 min cache
+def get_market_regime():
+    """
+    Compute broad market regime using SPY's position relative to 50/200-day MAs
+    plus VIX level. Returns dict the UI uses to display a banner and tier
+    individual stock signals.
+
+    Score 0-4:
+      4 = Strong Bull   (SPY above both MAs, golden cross, VIX < 25)
+      3 = Bull          (SPY above 200-day, structure intact)
+      2 = Transition    (mixed signals — whipsaw zone)
+      1 = Bear          (SPY below 200-day OR death cross)
+      0 = Strong Bear   (deep bear + elevated VIX)
+    """
+    try:
+        spy = _cached_history("SPY", "2y")
+        if spy.empty or len(spy) < 200:
+            return None
+        close = spy["Close"]
+        spot      = float(close.iloc[-1])
+        ma_50     = float(close.rolling(50).mean().iloc[-1])
+        ma_200    = float(close.rolling(200).mean().iloc[-1])
+        pct_50    = (spot - ma_50) / ma_50 * 100 if ma_50 > 0 else 0
+        pct_200   = (spot - ma_200) / ma_200 * 100 if ma_200 > 0 else 0
+        golden    = ma_50 > ma_200    # bullish structure
+        above_50  = spot > ma_50
+        above_200 = spot > ma_200
+
+        # VIX (best-effort — fall back to neutral if unavailable)
+        vix_val = None
+        try:
+            vix_hist = _cached_history("^VIX", "1mo")
+            if not vix_hist.empty:
+                vix_val = float(vix_hist["Close"].iloc[-1])
+        except Exception:
+            pass
+        if vix_val is None: vix_val = 18.0  # neutral default
+
+        # Score (each component +1)
+        score   = 0
+        signals = []
+        if above_200:
+            score += 1; signals.append(f"✅ SPY +{pct_200:.1f}% above 200-day (${ma_200:.2f})")
+        else:
+            signals.append(f"⚠️ SPY {pct_200:.1f}% below 200-day (${ma_200:.2f})")
+        if above_50:
+            score += 1; signals.append(f"✅ SPY +{pct_50:.1f}% above 50-day (${ma_50:.2f})")
+        else:
+            signals.append(f"⚠️ SPY {pct_50:.1f}% below 50-day (${ma_50:.2f})")
+        if golden:
+            score += 1; signals.append("✅ Golden cross structure (50-day above 200-day)")
+        else:
+            signals.append("⚠️ Death cross structure (50-day below 200-day)")
+        if vix_val < 25:
+            score += 1; signals.append(f"✅ VIX {vix_val:.1f} (fear gauge normal)")
+        else:
+            signals.append(f"⚠️ VIX {vix_val:.1f} (elevated fear)")
+
+        # Label + signal-tiering guidance
+        if score == 4:
+            label   = "🟢 Strong Bull"
+            tiering = (
+                "Trust BUY signals at normal threshold (≥8/14). Be skeptical of SELL signals — "
+                "often just noise in a strong uptrend. Hold winners through normal pullbacks. "
+                "Trim into strength rather than panic-selling."
+            )
+        elif score == 3:
+            label   = "🟢 Bull"
+            tiering = (
+                "Trust BUY signals (≥8/14). Watch for confirmation on SELL signals before acting. "
+                "Some weakness creeping in — tighten stops on extended winners."
+            )
+        elif score == 2:
+            label   = "🟡 Transition / Caution"
+            tiering = (
+                "WHIPSAW ZONE. Reduce activity. Demand higher confluence (≥9/14) for new entries. "
+                "Cost of being wrong is highest here. Cash is a legitimate position. "
+                "Wait for the regime to resolve before committing capital."
+            )
+        elif score == 1:
+            label   = "🔴 Bear"
+            tiering = (
+                "Trust SELL signals immediately — they tend to follow through. "
+                "BUY signals are countertrend; reduce position sizes 50%, demand ≥10/14 confluence. "
+                "Falling tide lowers all boats — even good setups can fail."
+            )
+        else:
+            label   = "🔴 Strong Bear"
+            tiering = (
+                "CAPITAL PRESERVATION MODE. Avoid new long positions. "
+                "Cash is a position. Any BUY only at ≥11/14 with strong sector confirmation. "
+                "Sell signals are gospel. Drawdown math is brutal — focus on not losing."
+            )
+
+        # Stretched flag — too-good-to-last warning even within bull regime
+        stretched = pct_50 > 8 and vix_val < 15
+        if stretched:
+            tiering += (
+                "  ⚠️ **EXTENDED:** SPY is far above 50-day with very low VIX — "
+                "consider trimming winners, tightening stops, being more selective on new entries."
+            )
+
+        return {
+            "score": score, "label": label, "tiering": tiering, "signals": signals,
+            "spy_spot": spot, "spy_50": ma_50, "spy_200": ma_200,
+            "vix": vix_val, "pct_above_50": pct_50, "pct_above_200": pct_200,
+            "stretched": stretched, "golden_cross": golden,
+        }
+    except Exception:
+        return None
+
+def render_market_regime_banner(expanded_default=False):
+    """Compact regime banner with expandable detail. Renders at top of modes."""
+    regime = get_market_regime()
+    if not regime:
+        return
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+        c1.markdown(f"### 🌐  Market Regime\n**{regime['label']}**")
+        c2.metric("SPY",
+                  f"${regime['spy_spot']:.2f}",
+                  f"{regime['pct_above_200']:+.1f}% vs 200d")
+        vix_state = ("🔴 Fear" if regime['vix']>25
+                     else "🟡 Complacent" if regime['vix']<13
+                     else "🟢 Normal")
+        c3.metric("VIX", f"{regime['vix']:.1f}", vix_state)
+        c4.metric("Score", f"{regime['score']}/4")
+        # Tiering guidance — the key actionable text
+        st.info(f"**Signal interpretation guidance:**  {regime['tiering']}")
+        with st.expander("Regime components", expanded=expanded_default):
+            for s in regime['signals']:
+                st.markdown(f"- {s}")
+            st.caption(
+                f"_Regime is recomputed every 15 minutes using SPY's position relative to "
+                f"50-day (${regime['spy_50']:.2f}) and 200-day (${regime['spy_200']:.2f}) MAs, "
+                f"the 50/200 cross structure, and VIX level._"
+            )
+
+# ================================================================
+# PERFORMANCE CACHE — retry-with-backoff, longer TTL
+# ================================================================
+@st.cache_data(ttl=1200, show_spinner=False)  # 20 min cache (bumped from 15)
 def _cached_history(symbol: str, period: str) -> pd.DataFrame:
     """Single-ticker history with one retry on transient failure."""
     for attempt in range(2):
@@ -1346,7 +1512,7 @@ def _cached_history(symbol: str, period: str) -> pd.DataFrame:
                 time.sleep(0.5)  # brief backoff before retry
     return pd.DataFrame()
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1200, show_spinner=False)  # 20 min (bumped from 15)
 def _batch_history(symbols_tuple: tuple, period: str) -> dict:
     """
     Batch-fetch via yf.download — single biggest performance win.
@@ -1608,6 +1774,24 @@ def generate_ai_analysis(symbol, metrics, period, method, fib_levels=None, extra
     if not AI_AVAILABLE: return "⚠️ AI unavailable — GEMINI_API_KEY not in Secrets."
     public = {k: v for k, v in metrics.items() if not k.startswith("_")}
     fib_text = ("\nFibonacci Levels:\n" + "\n".join(f"  {lbl}: ${lvl:.2f}" for lbl,lvl in fib_levels.items())) if fib_levels else ""
+
+    # ── Market regime context — lets the AI tier its recommendation ──
+    regime = get_market_regime()
+    if regime:
+        regime_block = (
+            f"\nBROADER MARKET REGIME (current):\n"
+            f"  Label: {regime['label']}  (score {regime['score']}/4)\n"
+            f"  SPY: ${regime['spy_spot']:.2f} ({regime['pct_above_200']:+.1f}% vs 200-day, "
+            f"{regime['pct_above_50']:+.1f}% vs 50-day)\n"
+            f"  VIX: {regime['vix']:.1f}  "
+            f"({'fearful' if regime['vix']>25 else 'complacent' if regime['vix']<13 else 'normal'})\n"
+            f"  Golden cross structure: {'yes' if regime['golden_cross'] else 'no'}\n"
+            f"  Stretched flag: {'YES — extended' if regime['stretched'] else 'no'}\n"
+            f"  Tiering rule: {regime['tiering']}\n"
+        )
+    else:
+        regime_block = ""
+
     prompt = f"""
 You are an elite institutional analyst. Analyse {symbol} clearly for a client who may be a beginner.
 Define jargon on first use. RSI uses Wilder's smoothing (same as TradingView/Bloomberg).
@@ -1616,6 +1800,7 @@ Signal Strength is a 0-14 multi-indicator confluence score with age-aware MA sco
 Live Data:
 {json.dumps(public, indent=2)}
 {fib_text}
+{regime_block}
 Framework: {period}-day {method}
 {f"Context: {extra_context}" if extra_context else ""}
 
@@ -1663,6 +1848,15 @@ Bull risk, bear risk, invalidation price, stop-loss zone (specific price range).
 
 ## Portfolio Strategy Suggestion
 **Action:** (buy/hold/sell/avoid). Entry zone, target, stop-loss, position size tier. Risk/reward summary.
+
+**CRITICAL — apply the broader market regime above to this recommendation.** A confluence score
+that earns "Strong Buy" in a Strong Bull regime might only earn "Watch" in a Bear regime where
+the same setup has a much lower probability of follow-through. State explicitly how the regime
+modifies your conviction:
+- In Strong Bull / Bull regime: trust BUY signals at normal sizing; be skeptical of SELL signals on otherwise-strong setups.
+- In Transition regime: smaller position size, demand higher confluence, wait for confirmation.
+- In Bear / Strong Bear regime: BUY signals are countertrend — reduce size 50%, require ≥10/14 confluence; SELL signals should be acted on immediately.
+- If the "stretched" flag is set: even in bull regime, advise trimming winners, tightening stops, being more selective on new entries.
 """
     errors = []
     for m in GEMINI_MODEL_CANDIDATES:
@@ -2165,6 +2359,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ================================================================
 if mode == "💼  My Portfolio":
     st.header("💼  Portfolio Dashboard")
+    render_market_regime_banner()
 
     if not SUPABASE_AVAILABLE:
         for k,v in [("user_portfolio",{}),("auth_user","local"),("auth_pin",""),("user_watchlist",[])]:
@@ -2264,47 +2459,68 @@ if mode == "💼  My Portfolio":
         render_portfolio_editor({}, uid, pin)
     else:
         total_value = total_cost = 0.0
-        rows, charts, load_errors = [], {}, []
+        rows, charts, load_errors, watchlist_charts = [], {}, [], {}
 
-        with st.spinner("Fetching live data (15-min cache active)…"):
-            for sym, pos in list(portfolio.items()):
-                _, metrics, fig, price, fib, score, err = fetch_technical_data(sym, sma_period, ma_type)
-                if err:
-                    load_errors.append(f"**{ticker_label(sym)}:** {err}"); continue
-                if price > 0:
-                    pos_cost = pos["shares"]*pos["cost"]; pos_value = pos["shares"]*price
-                    pos_gain = pos_value-pos_cost; pos_pct = (pos_gain/pos_cost*100) if pos_cost>0 else 0.0
-                    total_value += pos_value; total_cost += pos_cost
-                    if fig: charts[sym] = (fig, fib, metrics)
-                    rows.append({
-                        "Display":        ticker_label(sym), "Asset": sym,
-                        "Shares":         f"{pos['shares']:.8f}".rstrip("0").rstrip("."),
-                        "Avg Cost":       f"${pos['cost']:.2f}",
-                        "Current Price":  f"${price:.2f}",
-                        "Mkt Value":      f"${pos_value:,.2f}",
-                        "Return ($)":     f"${pos_gain:+,.2f}",
-                        "Return (%)":     f"{pos_pct:+.1f}%",
-                        "MA Signal":      metrics.get("MA Signal","—"),
-                        "Signal Age":     metrics.get("Signal Age","—"),
-                        "RSI":            metrics.get("RSI (Wilder)","—"),
-                        "Signal Strength":metrics.get("Signal Strength","—"),
-                    })
+        # ── ONE batch fetch covers BOTH portfolio + watch list ────
+        all_symbols = list(set(list(portfolio.keys()) + list(watchlist)))
+        lookback = INTERVAL_MAP[sma_period]["history"]
+
+        with st.spinner(f"Pre-fetching data for {len(all_symbols)} ticker(s) via batch API…"):
+            histories = _batch_history(tuple(sorted(all_symbols)), lookback)
+
+        # ── Phase 2: parallel indicator computation (no network in workers) ──
+        def _process_one(sym, is_holding):
+            return sym, is_holding, fetch_technical_data(
+                sym, sma_period, ma_type, prefetched_hist=histories.get(sym)
+            )
+
+        with st.spinner(f"Computing indicators for {len(all_symbols)} ticker(s)…"):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = []
+                for sym in portfolio.keys():
+                    futures.append(executor.submit(_process_one, sym, True))
+                for sym in watchlist:
+                    if sym not in portfolio:  # skip dupes
+                        futures.append(executor.submit(_process_one, sym, False))
+
+                for future in as_completed(futures):
+                    sym, is_holding, result = future.result()
+                    _, metrics, fig, price, fib, score, err = result
+
+                    if is_holding:
+                        pos = portfolio[sym]
+                        if err:
+                            load_errors.append(f"**{ticker_label(sym)}:** {err}")
+                            continue
+                        if price > 0:
+                            pos_cost  = pos["shares"] * pos["cost"]
+                            pos_value = pos["shares"] * price
+                            pos_gain  = pos_value - pos_cost
+                            pos_pct   = (pos_gain / pos_cost * 100) if pos_cost > 0 else 0.0
+                            total_value += pos_value; total_cost += pos_cost
+                            if fig: charts[sym] = (fig, fib, metrics)
+                            rows.append({
+                                "Display":        ticker_label(sym), "Asset": sym,
+                                "Shares":         f"{pos['shares']:.8f}".rstrip("0").rstrip("."),
+                                "Avg Cost":       f"${pos['cost']:.2f}",
+                                "Current Price":  f"${price:.2f}",
+                                "Mkt Value":      f"${pos_value:,.2f}",
+                                "Return ($)":     f"${pos_gain:+,.2f}",
+                                "Return (%)":     f"{pos_pct:+.1f}%",
+                                "MA Signal":      metrics.get("MA Signal","—"),
+                                "Signal Age":     metrics.get("Signal Age","—"),
+                                "RSI":            metrics.get("RSI (Wilder)","—"),
+                                "Signal Strength":metrics.get("Signal Strength","—"),
+                            })
+                    else:
+                        # Watchlist symbol
+                        if not err and metrics and fig:
+                            watchlist_charts[sym] = (fig, fib, metrics)
 
         if load_errors:
             with st.expander(f"⚠️  {len(load_errors)} position(s) could not load — click to see why", expanded=True):
                 for e in load_errors: st.warning(e)
                 st.caption("Common causes: insufficient history for the selected period. Try a shorter lookback or use the Edit table to fix tickers.")
-
-        # ── Fetch watch list signals for the notification box ──
-        watchlist_charts = {}
-        if watchlist:
-            with st.spinner(f"Checking watch list signals ({len(watchlist)} tickers)…"):
-                for wsym in watchlist:
-                    _, w_metrics, w_fig, w_price, w_fib, w_score, w_err = fetch_technical_data(
-                        wsym, sma_period, ma_type
-                    )
-                    if not w_err and w_metrics:
-                        watchlist_charts[wsym] = (w_fig, w_fib, w_metrics)
 
         # Fresh notifications — dual source (holdings + watch list)
         if charts or watchlist_charts:
@@ -2355,6 +2571,7 @@ if mode == "💼  My Portfolio":
 # ================================================================
 elif mode == "🔍  Analyze Single Asset":
     st.header("🔍  Single Asset Analysis")
+    render_market_regime_banner()
     st.caption("Any US stock or crypto — crypto auto-detected.")
     c1,c2 = st.columns([4,1])
     with c1:
@@ -2393,6 +2610,7 @@ elif mode == "🔍  Analyze Single Asset":
 # ================================================================
 elif mode == "🌐  Market Scanner":
     st.header("🌐  Market Scanner")
+    render_market_regime_banner()
     st.caption(
         "Every ticker scored 0–14 across 6 indicators (MA is age-aware). "
         "Batch-fetch is 5–10x faster than v2.8. Only tickers above your threshold are shown, sorted highest first."
@@ -2603,6 +2821,7 @@ elif mode == "🌐  Market Scanner":
 # ================================================================
 elif mode == "📈  Options Lab":
     st.header("📈  Options Lab — Educational Sandbox")
+    render_market_regime_banner()
     st.warning(
         "🎓 **Pure educational sandbox.** No real money. No broker connection. "
         "No trade recommendations — the AI here is an **analyzer**, not a recommender. "
